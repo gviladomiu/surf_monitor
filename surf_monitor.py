@@ -72,6 +72,14 @@ SPOT_LATITUDE: str | None = os.getenv("SPOT_LATITUDE")
 SPOT_LONGITUDE: str | None = os.getenv("SPOT_LONGITUDE")
 SPOT_NAME: str = os.getenv("SPOT_NAME", "Castelldefels")
 
+# URL para revisar la prevision visual de forma comoda al recibir la alerta.
+# El monitor NO usa esta web para los datos (usa Open-Meteo), pero Windguru
+# ofrece una vista grafica util para confirmar las condiciones de un vistazo
+# antes de decidir si ir. Cambiable via variable de entorno.
+SPOT_FORECAST_URL: str = os.getenv(
+    "SPOT_FORECAST_URL", "https://www.windguru.cz/201"
+)
+
 # --- Umbrales que definen si una franja es "surfeable" ---
 # (1) Altura total de ola minima (metros).
 WAVE_THRESHOLD: float = float(os.getenv("WAVE_THRESHOLD", "0.8"))
@@ -560,6 +568,7 @@ def send_telegram_alert(model: str, streak: list[SurfSlot]) -> bool:
         "_El Mediterraneo tiene periodo corto; aun asi estas son de las "
         "mejores ventanas. Confirma el viento antes de ir: offshore (de "
         "tierra) lo mejora mucho._\n\n"
+        f"🔗 Ver prevision completa: {SPOT_FORECAST_URL}\n\n"
         f"Fuente: Open-Meteo (modelo {model})"
     )
 
@@ -576,7 +585,9 @@ def send_telegram_alert(model: str, streak: list[SurfSlot]) -> bool:
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
+        # Dejamos la preview ACTIVADA: asi el mensaje muestra una tarjeta
+        # clicable de la web de prevision, comoda para abrir de un toque.
+        "disable_web_page_preview": False,
     }
 
     try:
