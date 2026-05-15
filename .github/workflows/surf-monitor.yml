@@ -68,6 +68,7 @@ jobs:
       PERIOD_THRESHOLD: "4.0"      # periodo minimo (s)
       WIND_MAX_KMH: "20"          # viento maximo (km/h)
       WIND_WAVE_DOMINANCE: "1.5"   # factor de dominancia del wind wave
+      DAYLIGHT_MARGIN_MIN: "30"    # min de margen al amanecer/anochecer
       CONSECUTIVE_SLOTS: "3"       # franjas seguidas para disparar la alerta
       TIMEZONE: "Europe/Madrid"
       LOG_LEVEL: "INFO"
