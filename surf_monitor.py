@@ -27,13 +27,16 @@ CALIBRACION PARA CASTELLDEFELS
     la logica usa la altura TOTAL como umbral de tamano, y mete la "calidad"
     (swell vs viento) y el viento como filtros adicionales.
 
-LOGICA: una franja horaria se considera SURFEABLE si cumple las 4 condiciones:
+LOGICA: una franja horaria se considera SURFEABLE si cumple las 5 condiciones:
     1. wave_height (altura total)  >= WAVE_THRESHOLD     (defecto 0.8 m)
     2. wave_period (periodo)       >= PERIOD_THRESHOLD   (defecto 4.0 s)
     3. wind_speed (viento)         <= WIND_MAX_KMH       (defecto 20 km/h)
     4. el wind wave NO aplasta al swell: wind_wave_height <=
        swell_wave_height * WIND_WAVE_DOMINANCE  (defecto 1.5)
        -> descarta mar picado donde el oleaje de viento domina claramente.
+    5. la franja esta DENTRO de horas de luz (orto y ocaso reales del dia,
+       con margen DAYLIGHT_MARGIN_MIN minutos en cada extremo).
+       -> no tiene sentido alertar de sesiones a medianoche.
 
     Si hay >= CONSECUTIVE_SLOTS franjas surfeables seguidas (defecto 3),
     se envia una alerta por Telegram con el detalle de la racha.
@@ -44,10 +47,12 @@ Variables de entorno:
     SPOT_LATITUDE          Latitud del spot (obligatorio). Ej: "41.25".
     SPOT_LONGITUDE         Longitud del spot (obligatorio). Ej: "2.00".
     SPOT_NAME              Nombre legible del spot (opcional). Ej: "Castelldefels".
+    SPOT_FORECAST_URL      Link de prevision visual en la alerta (opcional).
     WAVE_THRESHOLD         Altura total minima en metros (defecto 0.8).
     PERIOD_THRESHOLD       Periodo minimo en segundos (defecto 4.0).
     WIND_MAX_KMH           Viento maximo en km/h (defecto 20).
     WIND_WAVE_DOMINANCE    Factor de dominancia del wind wave (defecto 1.5).
+    DAYLIGHT_MARGIN_MIN    Minutos de margen al amanecer/anochecer (defecto 30).
     CONSECUTIVE_SLOTS      Franjas consecutivas requeridas (defecto 3).
     TIMEZONE               Zona horaria IANA (defecto "Europe/Madrid").
     LOG_LEVEL              DEBUG / INFO / WARNING / ERROR (defecto INFO).
@@ -91,6 +96,11 @@ WIND_MAX_KMH: float = float(os.getenv("WIND_MAX_KMH", "20"))
 #     picado y se descarta. 1.5 = el oleaje de viento puede ser hasta un 50%
 #     mayor que el swell antes de considerarse "demasiado picado".
 WIND_WAVE_DOMINANCE: float = float(os.getenv("WIND_WAVE_DOMINANCE", "1.5"))
+# (5) Solo horas con luz solar (no se puede surfear de noche). Calculamos el
+#     orto y el ocaso reales de cada dia (Open-Meteo los provee). El margen
+#     es en minutos: descarta la primera media hora despues del amanecer y
+#     la ultima antes del anochecer (luz rasante y debil). 0 = sin margen.
+DAYLIGHT_MARGIN_MIN: int = int(os.getenv("DAYLIGHT_MARGIN_MIN", "30"))
 
 # Numero de franjas horarias consecutivas surfeables que disparan la alerta.
 CONSECUTIVE_SLOTS: int = int(os.getenv("CONSECUTIVE_SLOTS", "3"))
@@ -151,6 +161,21 @@ log = logging.getLogger("surf_monitor")
 # ---------------------------------------------------------------------------
 
 @dataclass
+class AuxiliaryData:
+    """
+    Datos auxiliares comunes a todos los modelos (no dependen del modelo de
+    oleaje), descargados de la Forecast API de Open-Meteo en una sola llamada:
+      - wind_map: viento horario por timestamp ISO.
+      - daylight_by_date: por cada fecha (YYYY-MM-DD), una tupla con el inicio
+        y el fin del periodo de luz aprovechable (orto + margen, ocaso - margen).
+    Si la llamada fallara, las dos estructuras quedan vacias y el monitor lo
+    asume con criterio conservador (avisa de todos modos).
+    """
+    wind_map: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    daylight_by_date: dict[str, tuple[datetime, datetime]] = field(default_factory=dict)
+
+
+@dataclass
 class SurfSlot:
     """
     Una franja horaria con todos los datos relevantes para surf.
@@ -166,23 +191,27 @@ class SurfSlot:
     wind_wave_height: float | None      # Altura del oleaje de viento local (m)
     wind_speed: float | None = None     # Velocidad del viento a 10 m (km/h)
     wind_direction: float | None = None  # Direccion del viento (grados)
+    is_daylight: bool = True             # ¿Hay luz solar en esta franja?
 
     def is_surfable(self) -> tuple[bool, str]:
         """
         Evalua si la franja es surfeable. Devuelve (es_surfable, motivo).
         El 'motivo' explica por que NO lo es (util para los logs en DEBUG).
 
-        Las 4 condiciones (ver cabecera del archivo):
+        Las 5 condiciones (ver cabecera del archivo):
           1. altura total >= WAVE_THRESHOLD
           2. periodo >= PERIOD_THRESHOLD
           3. viento <= WIND_MAX_KMH
           4. wind wave no aplasta al swell
+          5. hay luz solar (no se puede surfear de noche)
 
         Criterio conservador con datos faltantes:
           - Si falta altura o periodo: NO surfeable (no podemos evaluar).
           - Si falta el viento: no penalizamos por esa condicion (la Forecast
             API puede haber fallado; mejor avisar que callar). Se anota.
           - Si falta swell o wind wave: no aplicamos la condicion 4.
+          - Si falta orto/ocaso: 'is_daylight' viene en True por defecto,
+            asi que no penalizamos la franja.
         """
         # (1) Altura total.
         if self.wave_height < WAVE_THRESHOLD:
@@ -207,6 +236,11 @@ class SurfSlot:
                 f"mar picado (wind {self.wind_wave_height:.2f}m vs "
                 f"swell {self.swell_height:.2f}m)"
             )
+
+        # (5) Luz solar. Si no hay luz, no se puede surfear, independientemente
+        # de lo buenas que sean las condiciones del mar.
+        if not self.is_daylight:
+            return False, "fuera de horas de luz (orto-ocaso)"
 
         return True, "OK"
 
@@ -295,47 +329,80 @@ def _safe_get(arr: list | None, i: int) -> float | None:
         return None
 
 
-def fetch_wind_forecast() -> dict[str, tuple[float | None, float | None]]:
+def fetch_auxiliary_data() -> AuxiliaryData:
     """
-    Descarga el viento de la Forecast API de Open-Meteo. Devuelve un dict
-    {timestamp_iso: (wind_speed_kmh, wind_direction_deg)}.
+    Descarga de la Forecast API de Open-Meteo los datos comunes a todos los
+    modelos de oleaje:
+      - Viento horario (velocidad + direccion).
+      - Orto y ocaso diarios, para descartar franjas de noche.
 
-    Si esta llamada falla, NO es critico: devolvemos dict vacio. La logica de
-    is_surfable() no penaliza las franjas sin dato de viento.
+    Se hace en una sola llamada (mezcla bloque 'hourly' y bloque 'daily').
+    Si fallara, devolvemos un AuxiliaryData vacio: el monitor sigue funcionando
+    con criterio conservador (no penaliza por falta de datos auxiliares).
     """
     params = {
         "latitude": SPOT_LATITUDE,
         "longitude": SPOT_LONGITUDE,
         "hourly": FORECAST_HOURLY_VARS,
+        "daily": "sunrise,sunset",
         "forecast_days": 4,
         "timezone": TIMEZONE,
-        # wind_speed_unit por defecto es km/h, lo dejamos explicito.
         "wind_speed_unit": "kmh",
     }
     try:
-        log.info("[viento] Consultando Forecast API de Open-Meteo...")
-        payload = _request_with_retries(FORECAST_API_URL, params, "viento")
+        log.info("[aux] Consultando Forecast API (viento + sol)...")
+        payload = _request_with_retries(FORECAST_API_URL, params, "aux")
     except Exception as e:
-        log.warning("[viento] No se pudo obtener el viento (no critico): %s", e)
-        return {}
+        log.warning("[aux] No se pudieron obtener datos auxiliares (no critico): %s", e)
+        return AuxiliaryData()
 
+    aux = AuxiliaryData()
+
+    # --- Viento (bloque 'hourly') ---
     hourly = payload.get("hourly", {})
     times = hourly.get("time", [])
     speeds = hourly.get("wind_speed_10m", [])
     dirs = hourly.get("wind_direction_10m", [])
-
-    wind_map: dict[str, tuple[float | None, float | None]] = {}
     for i, t in enumerate(times):
-        wind_map[t] = (_safe_get(speeds, i), _safe_get(dirs, i))
+        aux.wind_map[t] = (_safe_get(speeds, i), _safe_get(dirs, i))
+    log.info("[aux] Viento: %d franjas obtenidas.", len(aux.wind_map))
 
-    log.info("[viento] Obtenidos datos de viento para %d franjas.", len(wind_map))
-    return wind_map
+    # --- Orto y ocaso (bloque 'daily') ---
+    # Open-Meteo devuelve arrays paralelos: daily.time = ["2026-05-16", ...],
+    # daily.sunrise = ["2026-05-16T06:42", ...], daily.sunset = [...].
+    # Aplicamos el margen DAYLIGHT_MARGIN_MIN para acotar el periodo util.
+    daily = payload.get("daily", {})
+    dates = daily.get("time", [])
+    sunrises = daily.get("sunrise", [])
+    sunsets = daily.get("sunset", [])
+    margin = timedelta(minutes=DAYLIGHT_MARGIN_MIN)
+    for i, d in enumerate(dates):
+        try:
+            sr = datetime.fromisoformat(sunrises[i]) + margin
+            ss = datetime.fromisoformat(sunsets[i]) - margin
+            aux.daylight_by_date[d] = (sr, ss)
+        except (ValueError, TypeError, IndexError) as e:
+            log.debug("[aux] No se pudo parsear sol del dia %s: %s", d, e)
+
+    if aux.daylight_by_date:
+        sample_day = next(iter(aux.daylight_by_date.items()))
+        log.info(
+            "[aux] Luz solar: %d dias. Ejemplo %s -> %s a %s.",
+            len(aux.daylight_by_date),
+            sample_day[0],
+            sample_day[1][0].strftime("%H:%M"),
+            sample_day[1][1].strftime("%H:%M"),
+        )
+    else:
+        log.warning("[aux] No se obtuvieron horas de luz; no se filtrara por noche.")
+
+    return aux
 
 
 def fetch_model_forecast(
     model_label: str,
     model_id: str,
-    wind_map: dict[str, tuple[float | None, float | None]],
+    aux: AuxiliaryData,
 ) -> ModelForecast:
     """
     Descarga la prevision de oleaje para un modelo concreto y la cruza con el
@@ -398,7 +465,18 @@ def fetch_model_forecast(
             skipped += 1
             continue
 
-        wind_speed, wind_dir = wind_map.get(t, (None, None))
+        # Cruce con viento.
+        wind_speed, wind_dir = aux.wind_map.get(t, (None, None))
+
+        # Cruce con luz solar: ¿esta hora cae entre orto y ocaso del dia?
+        # Si no tenemos datos de sol para ese dia, asumimos True (no penalizar).
+        date_key = slot_dt.strftime("%Y-%m-%d")
+        daylight_range = aux.daylight_by_date.get(date_key)
+        if daylight_range is not None:
+            sunrise, sunset = daylight_range
+            is_daylight = sunrise <= slot_dt <= sunset
+        else:
+            is_daylight = True  # fallback conservador: no descartar
 
         slots.append(SurfSlot(
             dt=slot_dt,
@@ -410,6 +488,7 @@ def fetch_model_forecast(
             wind_wave_height=_safe_get(h_wind_w, i),
             wind_speed=wind_speed,
             wind_direction=wind_dir,
+            is_daylight=is_daylight,
         ))
 
     if skipped:
@@ -420,16 +499,17 @@ def fetch_model_forecast(
 
 def fetch_all_forecasts() -> dict[str, ModelForecast]:
     """
-    Descarga el viento una sola vez y luego la prevision de oleaje de cada
-    modelo. Si un modelo falla, se registra pero NO se aborta.
+    Descarga los datos auxiliares (viento + horas de luz) una sola vez y
+    luego la prevision de oleaje de cada modelo. Si un modelo falla, se
+    registra pero NO se aborta.
     """
-    # El viento es comun a todos los modelos: una sola llamada.
-    wind_map = fetch_wind_forecast()
+    # Datos comunes a todos los modelos: una sola llamada.
+    aux = fetch_auxiliary_data()
 
     forecasts: dict[str, ModelForecast] = {}
     for model_label, model_id in MODELS.items():
         try:
-            forecasts[model_label] = fetch_model_forecast(model_label, model_id, wind_map)
+            forecasts[model_label] = fetch_model_forecast(model_label, model_id, aux)
         except Exception as e:
             log.error("[%s] No se pudo obtener la prevision: %s", model_label, e)
 
@@ -622,8 +702,10 @@ def evaluate_and_alert(forecasts: dict[str, ModelForecast]) -> int:
     )
     log.info(
         "Criterio surfeable: altura >= %.1fm Y periodo >= %.1fs Y "
-        "viento <= %.0fkm/h Y wind wave no domina; %d franjas seguidas.",
-        WAVE_THRESHOLD, PERIOD_THRESHOLD, WIND_MAX_KMH, CONSECUTIVE_SLOTS,
+        "viento <= %.0fkm/h Y wind wave no domina Y hay luz solar "
+        "(margen +/-%dmin); %d franjas seguidas.",
+        WAVE_THRESHOLD, PERIOD_THRESHOLD, WIND_MAX_KMH,
+        DAYLIGHT_MARGIN_MIN, CONSECUTIVE_SLOTS,
     )
 
     for model_label in MODELS:
