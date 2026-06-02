@@ -1,61 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-surf_monitor.py  (Open-Meteo, logica orientada a surf en Castelldefels)
-=======================================================================
+surf_monitor.py  (Open-Meteo, multi-spot, orientado a surf en la costa de Barcelona)
+====================================================================================
 
-Monitor automatico de condiciones de surf para Castelldefels (Barcelona).
+Monitor automatico de condiciones de surf para VARIOS spots de la costa de
+Barcelona (Castelldefels, Masnou, Sitges...). Cada 6 horas revisa la prevision
+de cada spot, evalua si hay una ventana surfeable a partir de las proximas
+horas (el tiempo que necesitas para llegar al spot en coche), y avisa por
+Telegram con un mensaje por cada spot que tenga olas.
 
 FUENTE DE DATOS
     API publica y gratuita de Open-Meteo, dos endpoints:
-      - Marine API   : oleaje (altura, periodo, swell, wind wave).
-      - Forecast API : viento (velocidad y direccion).
-    Los modelos de oleaje son los del servicio aleman DWD: EWAM (Europa,
-    alta resolucion 5 km) y GWAM (global). Son los mismos que Windguru
-    etiqueta como "ICON Wave" / "EWAM". No requiere clave de API.
+      - Marine API   : oleaje (altura, periodo, swell, wind wave) + temperatura
+                       del agua (sea_surface_temperature).
+      - Forecast API : viento (velocidad y direccion) + orto/ocaso.
+    Los modelos de oleaje son los del servicio aleman DWD: EWAM (Europa, alta
+    resolucion 5 km) y GWAM (global). Son los mismos que Windguru etiqueta como
+    "ICON Wave" / "EWAM". No requiere clave de API.
 
 POR QUE LA ALTURA DE OLA NO BASTA PARA SURF
     Una ola de 1 m puede ser surfeable (si viene del SWELL, oleaje de fondo
     ordenado) o inservible (si es WIND WAVE, oleaje de viento local picado).
-    Ademas el PERIODO importa: con periodo corto la ola tiene poca energia.
-    Y el VIENTO local puede destrozar una sesion que sobre el papel era buena.
-
-CALIBRACION PARA CASTELLDEFELS
-    Castelldefels es un spot mediterraneo de SWELL DEBIL: el oleaje de fondo
-    raramente supera los 0.7-0.8 m, y el periodo raramente pasa de 5 s. Filtrar
-    por un umbral alto de swell dejaria el monitor practicamente mudo. Por eso
-    la logica usa la altura TOTAL como umbral de tamano, y mete la "calidad"
-    (swell vs viento) y el viento como filtros adicionales.
+    Ademas el PERIODO importa (poca energia si es corto), el VIENTO puede
+    destrozar la sesion, y de noche no se puede surfear.
 
 LOGICA: una franja horaria se considera SURFEABLE si cumple las 5 condiciones:
     1. wave_height (altura total)  >= WAVE_THRESHOLD     (defecto 0.8 m)
     2. wave_period (periodo)       >= PERIOD_THRESHOLD   (defecto 4.0 s)
     3. wind_speed (viento)         <= WIND_MAX_KMH       (defecto 20 km/h)
-    4. el wind wave NO aplasta al swell: wind_wave_height <=
-       swell_wave_height * WIND_WAVE_DOMINANCE  (defecto 1.5)
-       -> descarta mar picado donde el oleaje de viento domina claramente.
-    5. la franja esta DENTRO de horas de luz (orto y ocaso reales del dia,
-       con margen DAYLIGHT_MARGIN_MIN minutos en cada extremo).
-       -> no tiene sentido alertar de sesiones a medianoche.
+    4. el wind wave NO aplasta al swell (factor WIND_WAVE_DOMINANCE)
+    5. la franja esta en horas de luz (orto/ocaso + margen)
 
-    Si hay >= CONSECUTIVE_SLOTS franjas surfeables seguidas (defecto 3),
-    se envia una alerta por Telegram con el detalle de la racha.
+    Ademas, solo se consideran franjas a partir de AHORA + LEAD_TIME_HOURS
+    (defecto 3 h), el tiempo necesario para desplazarse al spot.
+
+    Si hay >= CONSECUTIVE_SLOTS franjas surfeables seguidas (defecto 3), el
+    spot tiene una "ventana". Se manda UN mensaje por spot con ventana,
+    combinando los dos modelos (EWAM y GWAM) y recomendando neopreno segun la
+    temperatura del agua.
 
 Variables de entorno:
     TELEGRAM_BOT_TOKEN     Token del bot de Telegram (obligatorio para alertas).
     TELEGRAM_CHAT_ID       Chat/grupo destino (obligatorio para alertas).
-    SPOT_LATITUDE          Latitud del spot (obligatorio). Ej: "41.25".
-    SPOT_LONGITUDE         Longitud del spot (obligatorio). Ej: "2.00".
-    SPOT_NAME              Nombre legible del spot (opcional). Ej: "Castelldefels".
-    SPOT_FORECAST_URL      Link de prevision visual en la alerta (opcional).
     WAVE_THRESHOLD         Altura total minima en metros (defecto 0.8).
     PERIOD_THRESHOLD       Periodo minimo en segundos (defecto 4.0).
     WIND_MAX_KMH           Viento maximo en km/h (defecto 20).
     WIND_WAVE_DOMINANCE    Factor de dominancia del wind wave (defecto 1.5).
     DAYLIGHT_MARGIN_MIN    Minutos de margen al amanecer/anochecer (defecto 30).
+    LEAD_TIME_HOURS        Horas de antelacion minima para ir al spot (defecto 3).
     CONSECUTIVE_SLOTS      Franjas consecutivas requeridas (defecto 3).
     TIMEZONE               Zona horaria IANA (defecto "Europe/Madrid").
     LOG_LEVEL              DEBUG / INFO / WARNING / ERROR (defecto INFO).
+
+NOTA: Los spots se definen en la lista SPOTS de este archivo (no por variables
+de entorno, porque son varios y cada uno tiene nombre, coordenadas y URL).
 """
 
 from __future__ import annotations
@@ -70,20 +69,46 @@ from datetime import datetime, timedelta
 import requests
 
 # ---------------------------------------------------------------------------
-# CONFIGURACION
+# DEFINICION DE SPOTS
 # ---------------------------------------------------------------------------
+# Cada spot tiene: nombre, latitud, longitud y URL de prevision visual
+# (Windguru, solo para el enlace de la alerta; los datos vienen de Open-Meteo).
+#
+# Para anadir o quitar spots, edita esta lista. Las coordenadas conviene que
+# esten ligeramente MAR ADENTRO para que el modelo de oleaje tenga cobertura.
 
-SPOT_LATITUDE: str | None = os.getenv("SPOT_LATITUDE")
-SPOT_LONGITUDE: str | None = os.getenv("SPOT_LONGITUDE")
-SPOT_NAME: str = os.getenv("SPOT_NAME", "Castelldefels")
+@dataclass
+class Spot:
+    name: str
+    latitude: float
+    longitude: float
+    forecast_url: str
 
-# URL para revisar la prevision visual de forma comoda al recibir la alerta.
-# El monitor NO usa esta web para los datos (usa Open-Meteo), pero Windguru
-# ofrece una vista grafica util para confirmar las condiciones de un vistazo
-# antes de decidir si ir. Cambiable via variable de entorno.
-SPOT_FORECAST_URL: str = os.getenv(
-    "SPOT_FORECAST_URL", "https://www.windguru.cz/201"
-)
+
+SPOTS: list[Spot] = [
+    Spot(
+        name="Castelldefels",
+        latitude=41.25,
+        longitude=2.00,
+        forecast_url="https://www.windguru.cz/201",
+    ),
+    Spot(
+        name="Masnou",
+        latitude=41.474775,
+        longitude=2.305556,
+        forecast_url="https://www.windguru.cz/501030",
+    ),
+    Spot(
+        name="Sitges",
+        latitude=41.234065,
+        longitude=1.820438,
+        forecast_url="https://www.windguru.cz/48885",
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# CONFIGURACION DE UMBRALES Y COMPORTAMIENTO
+# ---------------------------------------------------------------------------
 
 # --- Umbrales que definen si una franja es "surfeable" ---
 # (1) Altura total de ola minima (metros).
@@ -93,14 +118,14 @@ PERIOD_THRESHOLD: float = float(os.getenv("PERIOD_THRESHOLD", "4.0"))
 # (3) Viento maximo (km/h). Por encima, el mar se pica y la sesion se estropea.
 WIND_MAX_KMH: float = float(os.getenv("WIND_MAX_KMH", "20"))
 # (4) Dominancia del wind wave: si wind_wave > swell * este factor, es mar
-#     picado y se descarta. 1.5 = el oleaje de viento puede ser hasta un 50%
-#     mayor que el swell antes de considerarse "demasiado picado".
+#     picado y se descarta.
 WIND_WAVE_DOMINANCE: float = float(os.getenv("WIND_WAVE_DOMINANCE", "1.5"))
-# (5) Solo horas con luz solar (no se puede surfear de noche). Calculamos el
-#     orto y el ocaso reales de cada dia (Open-Meteo los provee). El margen
-#     es en minutos: descarta la primera media hora despues del amanecer y
-#     la ultima antes del anochecer (luz rasante y debil). 0 = sin margen.
+# (5) Solo horas con luz solar. Margen en minutos al amanecer/anochecer.
 DAYLIGHT_MARGIN_MIN: int = int(os.getenv("DAYLIGHT_MARGIN_MIN", "30"))
+
+# Antelacion minima: solo miramos franjas a partir de AHORA + estas horas,
+# que es el tiempo que necesitas para coger el coche e ir al spot.
+LEAD_TIME_HOURS: float = float(os.getenv("LEAD_TIME_HOURS", "3"))
 
 # Numero de franjas horarias consecutivas surfeables que disparan la alerta.
 CONSECUTIVE_SLOTS: int = int(os.getenv("CONSECUTIVE_SLOTS", "3"))
@@ -116,13 +141,11 @@ TELEGRAM_API_URL: str = "https://api.telegram.org/bot{token}/sendMessage"
 # ---------------------------------------------------------------------------
 # MODELOS DE OLEAJE
 # ---------------------------------------------------------------------------
-# Open-Meteo NO tiene un modelo marino llamado "icon". El ICON Wave del DWD
-# se publica dividido en:
-#   "ewam" -> DWD EWAM: Europa, alta resolucion 5 km. El mejor para Castelldefels.
+# Open-Meteo NO tiene un modelo marino llamado "icon". El ICON Wave del DWD se
+# publica dividido en:
+#   "ewam" -> DWD EWAM: Europa, alta resolucion 5 km. El mejor para esta costa.
 #   "gwam" -> DWD GWAM: global, 25 km. Segundo modelo / respaldo.
-# La clave del dict es el nombre "bonito" que sale en la alerta; el valor es el
-# identificador que entiende Open-Meteo. Otros validos: "ecmwf_wam",
-# "meteofrance_wave".
+# Otros validos: "ecmwf_wam", "meteofrance_wave".
 MODELS: dict[str, str] = {
     "EWAM": "ewam",
     "GWAM": "gwam",
@@ -132,11 +155,11 @@ MODELS: dict[str, str] = {
 MARINE_API_URL: str = "https://marine-api.open-meteo.com/v1/marine"
 FORECAST_API_URL: str = "https://api.open-meteo.com/v1/forecast"
 
-# Variables de oleaje que pedimos a la Marine API.
+# Variables de oleaje que pedimos a la Marine API (incluye temperatura del agua).
 MARINE_HOURLY_VARS: str = (
     "wave_height,wave_period,wave_direction,"
     "swell_wave_height,swell_wave_period,"
-    "wind_wave_height"
+    "wind_wave_height,sea_surface_temperature"
 )
 # Variables de la Forecast API: solo viento.
 FORECAST_HOURLY_VARS: str = "wind_speed_10m,wind_direction_10m"
@@ -163,13 +186,11 @@ log = logging.getLogger("surf_monitor")
 @dataclass
 class AuxiliaryData:
     """
-    Datos auxiliares comunes a todos los modelos (no dependen del modelo de
-    oleaje), descargados de la Forecast API de Open-Meteo en una sola llamada:
+    Datos auxiliares comunes a todos los modelos de UN spot (no dependen del
+    modelo de oleaje), de la Forecast API:
       - wind_map: viento horario por timestamp ISO.
-      - daylight_by_date: por cada fecha (YYYY-MM-DD), una tupla con el inicio
-        y el fin del periodo de luz aprovechable (orto + margen, ocaso - margen).
-    Si la llamada fallara, las dos estructuras quedan vacias y el monitor lo
-    asume con criterio conservador (avisa de todos modos).
+      - daylight_by_date: por fecha, (inicio_luz, fin_luz) con margen aplicado.
+    Si la llamada falla, las estructuras quedan vacias (criterio conservador).
     """
     wind_map: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     daylight_by_date: dict[str, tuple[datetime, datetime]] = field(default_factory=dict)
@@ -179,8 +200,8 @@ class AuxiliaryData:
 class SurfSlot:
     """
     Una franja horaria con todos los datos relevantes para surf.
-    Los campos opcionales pueden ser None si la API no los trajo; la logica
-    de is_surfable() lo gestiona de forma conservadora.
+    Los campos opcionales pueden ser None si la API no los trajo; la logica de
+    is_surfable() lo gestiona de forma conservadora.
     """
     dt: datetime                        # Momento (horario local)
     wave_height: float                  # Altura total de ola (m)
@@ -189,6 +210,7 @@ class SurfSlot:
     swell_height: float | None          # Altura del oleaje de fondo / swell (m)
     swell_period: float | None          # Periodo del swell (s)
     wind_wave_height: float | None      # Altura del oleaje de viento local (m)
+    water_temp: float | None = None     # Temperatura del agua (C)
     wind_speed: float | None = None     # Velocidad del viento a 10 m (km/h)
     wind_direction: float | None = None  # Direccion del viento (grados)
     is_daylight: bool = True             # ¿Hay luz solar en esta franja?
@@ -196,36 +218,16 @@ class SurfSlot:
     def is_surfable(self) -> tuple[bool, str]:
         """
         Evalua si la franja es surfeable. Devuelve (es_surfable, motivo).
-        El 'motivo' explica por que NO lo es (util para los logs en DEBUG).
-
-        Las 5 condiciones (ver cabecera del archivo):
-          1. altura total >= WAVE_THRESHOLD
-          2. periodo >= PERIOD_THRESHOLD
-          3. viento <= WIND_MAX_KMH
-          4. wind wave no aplasta al swell
-          5. hay luz solar (no se puede surfear de noche)
-
-        Criterio conservador con datos faltantes:
-          - Si falta altura o periodo: NO surfeable (no podemos evaluar).
-          - Si falta el viento: no penalizamos por esa condicion (la Forecast
-            API puede haber fallado; mejor avisar que callar). Se anota.
-          - Si falta swell o wind wave: no aplicamos la condicion 4.
-          - Si falta orto/ocaso: 'is_daylight' viene en True por defecto,
-            asi que no penalizamos la franja.
+        Las 5 condiciones (ver cabecera). Criterio conservador con datos
+        faltantes: si falta altura/periodo -> no surfeable; si falta viento o
+        sol -> no penaliza por esa condicion.
         """
-        # (1) Altura total.
         if self.wave_height < WAVE_THRESHOLD:
             return False, f"altura {self.wave_height:.2f}m < {WAVE_THRESHOLD}m"
-
-        # (2) Periodo.
         if self.wave_period < PERIOD_THRESHOLD:
             return False, f"periodo {self.wave_period:.1f}s < {PERIOD_THRESHOLD}s"
-
-        # (3) Viento. Si no hay dato, no penalizamos (pero lo anotamos).
         if self.wind_speed is not None and self.wind_speed > WIND_MAX_KMH:
             return False, f"viento {self.wind_speed:.0f}km/h > {WIND_MAX_KMH}km/h"
-
-        # (4) El wind wave no debe aplastar al swell.
         if (
             self.swell_height is not None
             and self.wind_wave_height is not None
@@ -236,21 +238,12 @@ class SurfSlot:
                 f"mar picado (wind {self.wind_wave_height:.2f}m vs "
                 f"swell {self.swell_height:.2f}m)"
             )
-
-        # (5) Luz solar. Si no hay luz, no se puede surfear, independientemente
-        # de lo buenas que sean las condiciones del mar.
         if not self.is_daylight:
             return False, "fuera de horas de luz (orto-ocaso)"
-
         return True, "OK"
 
     def quality_label(self) -> str:
-        """
-        Etiqueta informativa de la calidad del mar:
-          - "limpio"  si el swell predomina sobre el oleaje de viento.
-          - "picado"  si el oleaje de viento predomina.
-          - "mixto"   si estan parejos o falta el dato.
-        """
+        """Calidad del mar: limpio / picado / mixto (informativo)."""
         if self.swell_height is None or self.wind_wave_height is None:
             return "mixto"
         if self.swell_height >= self.wind_wave_height * 1.2:
@@ -270,9 +263,53 @@ class SurfSlot:
 
 @dataclass
 class ModelForecast:
-    """Prevision completa para un modelo (EWAM, GWAM, ...)."""
+    """Prevision de un modelo (EWAM, GWAM) para un spot."""
     name: str
     slots: list[SurfSlot] = field(default_factory=list)
+
+
+@dataclass
+class SpotResult:
+    """
+    Resultado de evaluar un spot: las rachas surfeables encontradas por modelo
+    y la temperatura del agua representativa.
+    """
+    spot: Spot
+    streaks_by_model: dict[str, list[list[SurfSlot]]] = field(default_factory=dict)
+    water_temp: float | None = None
+
+    def has_window(self) -> bool:
+        """True si algun modelo encontro al menos una racha."""
+        return any(streaks for streaks in self.streaks_by_model.values())
+
+
+# ---------------------------------------------------------------------------
+# NEOPRENO SEGUN TEMPERATURA DEL AGUA
+# ---------------------------------------------------------------------------
+# Recomendacion de grosor de neopreno para una sesion de 2-3 h (exposicion
+# prolongada, por lo que se tiende a abrigar un punto mas que para un bano
+# corto). Los rangos son los habituales en guias de surf para aguas templadas.
+
+def wetsuit_recommendation(water_temp: float | None) -> str:
+    """
+    Devuelve una recomendacion de neopreno en texto segun la temperatura del
+    agua, pensada para una sesion larga (2-3 h). Si no hay dato, lo indica.
+    """
+    if water_temp is None:
+        return "sin dato de temperatura del agua"
+
+    t = water_temp
+    if t >= 24:
+        return f"agua ~{t:.0f}C: lycra o sin neopreno (a lo sumo top de 1-2 mm)"
+    if t >= 22:
+        return f"agua ~{t:.0f}C: shorty 2 mm o neopreno corto"
+    if t >= 19:
+        return f"agua ~{t:.0f}C: neopreno 3/2 mm"
+    if t >= 16:
+        return f"agua ~{t:.0f}C: neopreno 4/3 mm (valora escarpines)"
+    if t >= 13:
+        return f"agua ~{t:.0f}C: neopreno 5/4 mm + escarpines; guantes y capucha si aguantas 2-3 h"
+    return f"agua ~{t:.0f}C: 5/4 mm o mas, con capucha, guantes y escarpines (sesion larga exige abrigo extra)"
 
 
 # ---------------------------------------------------------------------------
@@ -280,29 +317,20 @@ class ModelForecast:
 # ---------------------------------------------------------------------------
 
 def _request_with_retries(url: str, params: dict, label: str) -> dict:
-    """
-    GET con reintentos y back-off exponencial. Devuelve el JSON parseado o
-    lanza RuntimeError. 'label' es solo para los mensajes de log.
-    """
+    """GET con reintentos y back-off exponencial. Devuelve JSON o lanza."""
     last_err: Exception | None = None
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             log.debug("[%s] GET %s params=%s (intento %d)", label, url, params, attempt)
             resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-
-            # Open-Meteo devuelve 400 con {"error": true, "reason": ...}
-            # cuando un parametro es incorrecto. Mostramos el motivo exacto.
             if resp.status_code == 400:
                 try:
                     reason = resp.json().get("reason", "desconocido")
                 except Exception:
                     reason = resp.text[:200]
                 raise RuntimeError(f"Open-Meteo rechazo la peticion: {reason}")
-
             resp.raise_for_status()
             return resp.json()
-
         except (requests.RequestException, RuntimeError, ValueError) as e:
             last_err = e
             log.warning("[%s] Fallo en intento %d/%d: %s", label, attempt, MAX_RETRIES, e)
@@ -310,7 +338,6 @@ def _request_with_retries(url: str, params: dict, label: str) -> dict:
                 sleep_s = RETRY_BACKOFF_SECONDS * attempt
                 log.info("[%s] Reintentando en %d s...", label, sleep_s)
                 time.sleep(sleep_s)
-
     raise RuntimeError(
         f"[{label}] No se pudo consultar Open-Meteo tras {MAX_RETRIES} intentos: {last_err}"
     )
@@ -329,48 +356,36 @@ def _safe_get(arr: list | None, i: int) -> float | None:
         return None
 
 
-def fetch_auxiliary_data() -> AuxiliaryData:
+def fetch_auxiliary_data(spot: Spot) -> AuxiliaryData:
     """
-    Descarga de la Forecast API de Open-Meteo los datos comunes a todos los
-    modelos de oleaje:
-      - Viento horario (velocidad + direccion).
-      - Orto y ocaso diarios, para descartar franjas de noche.
-
-    Se hace en una sola llamada (mezcla bloque 'hourly' y bloque 'daily').
-    Si fallara, devolvemos un AuxiliaryData vacio: el monitor sigue funcionando
-    con criterio conservador (no penaliza por falta de datos auxiliares).
+    Descarga viento + orto/ocaso de la Forecast API para un spot concreto.
+    Si falla, devuelve AuxiliaryData vacio (criterio conservador).
     """
     params = {
-        "latitude": SPOT_LATITUDE,
-        "longitude": SPOT_LONGITUDE,
+        "latitude": spot.latitude,
+        "longitude": spot.longitude,
         "hourly": FORECAST_HOURLY_VARS,
         "daily": "sunrise,sunset",
         "forecast_days": 4,
         "timezone": TIMEZONE,
         "wind_speed_unit": "kmh",
     }
+    label = f"{spot.name}/aux"
     try:
-        log.info("[aux] Consultando Forecast API (viento + sol)...")
-        payload = _request_with_retries(FORECAST_API_URL, params, "aux")
+        log.info("[%s] Consultando Forecast API (viento + sol)...", label)
+        payload = _request_with_retries(FORECAST_API_URL, params, label)
     except Exception as e:
-        log.warning("[aux] No se pudieron obtener datos auxiliares (no critico): %s", e)
+        log.warning("[%s] No se pudieron obtener datos auxiliares (no critico): %s", label, e)
         return AuxiliaryData()
 
     aux = AuxiliaryData()
-
-    # --- Viento (bloque 'hourly') ---
     hourly = payload.get("hourly", {})
     times = hourly.get("time", [])
     speeds = hourly.get("wind_speed_10m", [])
     dirs = hourly.get("wind_direction_10m", [])
     for i, t in enumerate(times):
         aux.wind_map[t] = (_safe_get(speeds, i), _safe_get(dirs, i))
-    log.info("[aux] Viento: %d franjas obtenidas.", len(aux.wind_map))
 
-    # --- Orto y ocaso (bloque 'daily') ---
-    # Open-Meteo devuelve arrays paralelos: daily.time = ["2026-05-16", ...],
-    # daily.sunrise = ["2026-05-16T06:42", ...], daily.sunset = [...].
-    # Aplicamos el margen DAYLIGHT_MARGIN_MIN para acotar el periodo util.
     daily = payload.get("daily", {})
     dates = daily.get("time", [])
     sunrises = daily.get("sunrise", [])
@@ -381,61 +396,44 @@ def fetch_auxiliary_data() -> AuxiliaryData:
             sr = datetime.fromisoformat(sunrises[i]) + margin
             ss = datetime.fromisoformat(sunsets[i]) - margin
             aux.daylight_by_date[d] = (sr, ss)
-        except (ValueError, TypeError, IndexError) as e:
-            log.debug("[aux] No se pudo parsear sol del dia %s: %s", d, e)
+        except (ValueError, TypeError, IndexError):
+            pass
 
-    if aux.daylight_by_date:
-        sample_day = next(iter(aux.daylight_by_date.items()))
-        log.info(
-            "[aux] Luz solar: %d dias. Ejemplo %s -> %s a %s.",
-            len(aux.daylight_by_date),
-            sample_day[0],
-            sample_day[1][0].strftime("%H:%M"),
-            sample_day[1][1].strftime("%H:%M"),
-        )
-    else:
-        log.warning("[aux] No se obtuvieron horas de luz; no se filtrara por noche.")
-
+    log.info(
+        "[%s] Viento: %d franjas. Luz solar: %d dias.",
+        label, len(aux.wind_map), len(aux.daylight_by_date),
+    )
     return aux
 
 
-def fetch_model_forecast(
-    model_label: str,
-    model_id: str,
-    aux: AuxiliaryData,
-) -> ModelForecast:
+def fetch_model_forecast(spot: Spot, model_label: str, model_id: str, aux: AuxiliaryData) -> ModelForecast:
     """
-    Descarga la prevision de oleaje para un modelo concreto y la cruza con el
-    viento ya descargado. Devuelve un ModelForecast con la lista de SurfSlot.
+    Descarga la prevision de oleaje de un modelo para un spot y la cruza con
+    viento y luz. Devuelve un ModelForecast con la lista de SurfSlot.
     """
     params = {
-        "latitude": SPOT_LATITUDE,
-        "longitude": SPOT_LONGITUDE,
+        "latitude": spot.latitude,
+        "longitude": spot.longitude,
         "hourly": MARINE_HOURLY_VARS,
-        # 4 dias: hoy, manana, pasado manana y el dia siguiente.
         "forecast_days": 4,
         "timezone": TIMEZONE,
         "models": model_id,
         "length_unit": "metric",
-        # Preferimos celda de MAR para evitar nulls cerca de la costa.
         "cell_selection": "sea",
     }
+    label = f"{spot.name}/{model_label}"
+    log.info("[%s] Consultando Open-Meteo Marine (modelo '%s')...", label, model_id)
+    payload = _request_with_retries(MARINE_API_URL, params, label)
 
-    log.info("[%s] Consultando Open-Meteo Marine (modelo '%s')...", model_label, model_id)
-    payload = _request_with_retries(MARINE_API_URL, params, model_label)
-
-    # Open-Meteo "encaja" la peticion a la celda de modelo mas cercana. Si la
-    # celda devuelta esta lejos de la pedida, conviene saberlo.
-    resp_lat = payload.get("latitude")
-    resp_lon = payload.get("longitude")
     log.info(
         "[%s] Open-Meteo respondio para lat=%s lon=%s (pedido: %s, %s).",
-        model_label, resp_lat, resp_lon, SPOT_LATITUDE, SPOT_LONGITUDE,
+        label, payload.get("latitude"), payload.get("longitude"),
+        spot.latitude, spot.longitude,
     )
 
     hourly = payload.get("hourly")
     if not isinstance(hourly, dict):
-        log.warning("[%s] La respuesta no contiene bloque 'hourly'.", model_label)
+        log.warning("[%s] La respuesta no contiene bloque 'hourly'.", label)
         return ModelForecast(name=model_label, slots=[])
 
     times = hourly.get("time", [])
@@ -445,9 +443,10 @@ def fetch_model_forecast(
     h_swell_h = hourly.get("swell_wave_height", [])
     h_swell_p = hourly.get("swell_wave_period", [])
     h_wind_w = hourly.get("wind_wave_height", [])
+    h_water = hourly.get("sea_surface_temperature", [])
 
     if not times or not h_wave:
-        log.warning("[%s] Faltan 'time' o 'wave_height' en la respuesta.", model_label)
+        log.warning("[%s] Faltan 'time' o 'wave_height'.", label)
         return ModelForecast(name=model_label, slots=[])
 
     slots: list[SurfSlot] = []
@@ -455,7 +454,6 @@ def fetch_model_forecast(
     for i, t in enumerate(times):
         wh = _safe_get(h_wave, i)
         wp = _safe_get(h_period, i)
-        # Sin altura o sin periodo no podemos evaluar la franja.
         if wh is None or wp is None:
             skipped += 1
             continue
@@ -465,18 +463,15 @@ def fetch_model_forecast(
             skipped += 1
             continue
 
-        # Cruce con viento.
         wind_speed, wind_dir = aux.wind_map.get(t, (None, None))
 
-        # Cruce con luz solar: ¿esta hora cae entre orto y ocaso del dia?
-        # Si no tenemos datos de sol para ese dia, asumimos True (no penalizar).
         date_key = slot_dt.strftime("%Y-%m-%d")
         daylight_range = aux.daylight_by_date.get(date_key)
         if daylight_range is not None:
             sunrise, sunset = daylight_range
             is_daylight = sunrise <= slot_dt <= sunset
         else:
-            is_daylight = True  # fallback conservador: no descartar
+            is_daylight = True
 
         slots.append(SurfSlot(
             dt=slot_dt,
@@ -486,63 +481,45 @@ def fetch_model_forecast(
             swell_height=_safe_get(h_swell_h, i),
             swell_period=_safe_get(h_swell_p, i),
             wind_wave_height=_safe_get(h_wind_w, i),
+            water_temp=_safe_get(h_water, i),
             wind_speed=wind_speed,
             wind_direction=wind_dir,
             is_daylight=is_daylight,
         ))
 
     if skipped:
-        log.debug("[%s] %d franjas descartadas por datos incompletos.", model_label, skipped)
-    log.info("[%s] Obtenidas %d franjas con datos completos.", model_label, len(slots))
+        log.debug("[%s] %d franjas descartadas por datos incompletos.", label, skipped)
+    log.info("[%s] Obtenidas %d franjas con datos completos.", label, len(slots))
     return ModelForecast(name=model_label, slots=slots)
 
 
-def fetch_all_forecasts() -> dict[str, ModelForecast]:
-    """
-    Descarga los datos auxiliares (viento + horas de luz) una sola vez y
-    luego la prevision de oleaje de cada modelo. Si un modelo falla, se
-    registra pero NO se aborta.
-    """
-    # Datos comunes a todos los modelos: una sola llamada.
-    aux = fetch_auxiliary_data()
-
-    forecasts: dict[str, ModelForecast] = {}
-    for model_label, model_id in MODELS.items():
-        try:
-            forecasts[model_label] = fetch_model_forecast(model_label, model_id, aux)
-        except Exception as e:
-            log.error("[%s] No se pudo obtener la prevision: %s", model_label, e)
-
-    if not forecasts:
-        raise RuntimeError("No se obtuvo prevision de ningun modelo.")
-
-    return forecasts
-
-
 # ---------------------------------------------------------------------------
-# LOGICA DE NEGOCIO: FILTRADO Y DETECCION
+# LOGICA DE NEGOCIO: VENTANA TEMPORAL, FILTRADO Y DETECCION
 # ---------------------------------------------------------------------------
 
-def get_target_window(reference: datetime | None = None) -> tuple[datetime, datetime]:
+def get_search_start(reference: datetime | None = None) -> datetime:
     """
-    Devuelve el rango [inicio, fin) que cubre 'pasado manana' y el dia
-    siguiente, como datetimes a medianoche en horario LOCAL.
+    Devuelve el momento a partir del cual buscamos ventanas: AHORA mas el
+    tiempo de antelacion (LEAD_TIME_HOURS), redondeado hacia arriba a la hora
+    en punto (los datos de Open-Meteo son horarios).
     """
     ref = reference or datetime.now()
-    day_after_tomorrow = (ref + timedelta(days=2)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    end = day_after_tomorrow + timedelta(days=2)  # exclusivo: cubre 2 dias
-    return day_after_tomorrow, end
+    start = ref + timedelta(hours=LEAD_TIME_HOURS)
+    # Redondear hacia arriba a la siguiente hora en punto.
+    if start.minute > 0 or start.second > 0 or start.microsecond > 0:
+        start = start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        start = start.replace(minute=0, second=0, microsecond=0)
+    return start
 
 
-def filter_slots_for_window(slots: list[SurfSlot]) -> list[SurfSlot]:
+def filter_slots_from_now(slots: list[SurfSlot], reference: datetime | None = None) -> list[SurfSlot]:
     """
-    Conserva solo las franjas dentro de la ventana de interes
-    (pasado manana + el dia siguiente). Devuelve la lista ordenada por tiempo.
+    Conserva solo las franjas a partir de AHORA + LEAD_TIME_HOURS, ordenadas.
+    Miramos hacia delante hasta el final de los datos disponibles (~4 dias).
     """
-    start, end = get_target_window()
-    filtered = [s for s in slots if start <= s.dt < end]
+    start = get_search_start(reference)
+    filtered = [s for s in slots if s.dt >= start]
     filtered.sort(key=lambda s: s.dt)
     return filtered
 
@@ -552,38 +529,40 @@ def find_all_surfable_streaks(
     min_consecutive: int = CONSECUTIVE_SLOTS,
 ) -> list[list[SurfSlot]]:
     """
-    Devuelve una lista con TODAS las rachas de 'min_consecutive' o mas franjas
-    consecutivas surfeables encontradas en la lista de slots.
-
-    Cada racha es una lista de SurfSlot consecutivos que cumplen el criterio.
-    Una franja no-surfeable corta la racha; el algoritmo busca la siguiente.
-    Las rachas se devuelven en orden cronologico (la primera de la lista es
-    la mas cercana en el tiempo).
-
-    Si no hay ninguna racha que llegue al minimo, devuelve lista vacia.
-
-    Como Open-Meteo entrega datos horarios continuos, una "racha" equivale a
-    horas consecutivas surfeables sin interrupcion.
+    Devuelve TODAS las rachas de 'min_consecutive'+ franjas consecutivas
+    surfeables, en orden cronologico. Una franja no-surfeable corta la racha.
     """
     streaks: list[list[SurfSlot]] = []
     current: list[SurfSlot] = []
-
     for s in slots:
         surfable, _ = s.is_surfable()
         if surfable:
             current.append(s)
         else:
-            # La franja rompe la racha actual: si era larga, la guardamos.
             if len(current) >= min_consecutive:
                 streaks.append(current)
             current = []
-
-    # Importante: si la lista de slots TERMINA en medio de una racha, hay
-    # que guardarla tambien (el bucle solo guarda al encontrar una no-surfeable).
     if len(current) >= min_consecutive:
         streaks.append(current)
-
     return streaks
+
+
+def representative_water_temp(forecasts: dict[str, ModelForecast], reference: datetime | None = None) -> float | None:
+    """
+    Temperatura del agua representativa para el spot: la del primer slot futuro
+    con dato (la mas cercana en el tiempo a partir de la ventana de busqueda).
+    """
+    start = get_search_start(reference)
+    for forecast in forecasts.values():
+        for s in sorted(forecast.slots, key=lambda x: x.dt):
+            if s.dt >= start and s.water_temp is not None:
+                return s.water_temp
+    # Si no hay nada futuro, probar cualquier dato disponible.
+    for forecast in forecasts.values():
+        for s in forecast.slots:
+            if s.water_temp is not None:
+                return s.water_temp
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -601,15 +580,11 @@ def _degrees_to_compass(deg: float | None) -> str:
 
 
 def _summarize_streak(streak: list[SurfSlot]) -> str:
-    """
-    Construye un resumen legible de la racha para el mensaje de Telegram.
-    """
+    """Resumen legible de una racha para el mensaje de Telegram."""
     first, last = streak[0], streak[-1]
-
     heights = [s.wave_height for s in streak]
     periods = [s.wave_period for s in streak]
 
-    # Calidad predominante en la racha.
     labels = [s.quality_label() for s in streak]
     if labels.count("limpio") > labels.count("picado"):
         quality = "mar limpio (predomina el swell de fondo)"
@@ -618,16 +593,14 @@ def _summarize_streak(streak: list[SurfSlot]) -> str:
     else:
         quality = "mar mixto (swell y viento parejos)"
 
-    # Viento medio de la racha (si hay dato).
     winds = [s.wind_speed for s in streak if s.wind_speed is not None]
     if winds:
         wind_avg = sum(winds) / len(winds)
         mid_dir = streak[len(streak) // 2].wind_direction
         wind_txt = f"{wind_avg:.0f} km/h del {_degrees_to_compass(mid_dir)}"
     else:
-        wind_txt = "sin dato (no penalizado)"
+        wind_txt = "sin dato"
 
-    # Direccion de la ola (de la franja central como referencia).
     mid_wavedir = streak[len(streak) // 2].wave_direction
     wavedir_txt = _degrees_to_compass(mid_wavedir)
 
@@ -642,60 +615,64 @@ def _summarize_streak(streak: list[SurfSlot]) -> str:
     return "\n".join(lines)
 
 
+def build_spot_message(result: SpotResult) -> str:
+    """
+    Construye el mensaje de Telegram para UN spot, combinando los dos modelos
+    (EWAM y GWAM) y anadiendo temperatura del agua y recomendacion de neopreno.
+    """
+    spot = result.spot
+
+    # Cabecera con temperatura del agua y neopreno.
+    temp = result.water_temp
+    temp_txt = f"{temp:.0f}C" if temp is not None else "sin dato"
+    wetsuit = wetsuit_recommendation(temp)
+
+    partes = [
+        "🏄 *Ventana de surf detectada*",
+        "",
+        f"Spot: *{spot.name}*",
+        f"Agua: {temp_txt}",
+        f"Neopreno (sesion 2-3 h): {wetsuit}",
+        "",
+        f"Criterio: olas >= {WAVE_THRESHOLD:.1f} m, periodo >= "
+        f"{PERIOD_THRESHOLD:.1f} s, viento < {WIND_MAX_KMH:.0f} km/h, con luz, "
+        f"a partir de +{LEAD_TIME_HOURS:.0f} h.",
+    ]
+
+    # Bloque por cada modelo que tenga rachas.
+    for model_label in MODELS:
+        streaks = result.streaks_by_model.get(model_label, [])
+        if not streaks:
+            continue
+        partes.append("")
+        n = len(streaks)
+        if n == 1:
+            partes.append(f"*Modelo {model_label}* — 1 ventana:")
+        else:
+            partes.append(f"*Modelo {model_label}* — {n} ventanas:")
+        for i, streak in enumerate(streaks, start=1):
+            etiqueta = f"  Ventana {i} ({len(streak)} h)" if n > 1 else f"  ({len(streak)} h)"
+            partes.append(etiqueta)
+            partes.append(_summarize_streak(streak))
+
+    partes.append("")
+    partes.append(f"🔗 Ver prevision completa: {spot.forecast_url}")
+    partes.append("")
+    partes.append("Fuente: Open-Meteo (modelos EWAM y GWAM, DWD)")
+
+    return "\n".join(partes)
+
+
 # ---------------------------------------------------------------------------
 # NOTIFICACION A TELEGRAM
 # ---------------------------------------------------------------------------
 
-def send_telegram_alert(model: str, streaks: list[list[SurfSlot]]) -> bool:
-    """
-    Envia un UNICO mensaje de alerta a Telegram con TODAS las rachas
-    surfeables detectadas por este modelo en la ventana de evaluacion.
-    Devuelve True si se envio OK. Si no hay credenciales, muestra el mensaje
-    por consola.
-    """
-    if not streaks:
-        return False
-
-    # Cabecera: cuantas rachas se han detectado y dia(s) afectado(s).
-    n = len(streaks)
-    if n == 1:
-        cabecera = "Detectada *1 ventana surfeable*"
-    else:
-        cabecera = f"Detectadas *{n} ventanas surfeables*"
-
-    # Dias unicos cubiertos por las rachas, en orden.
-    dias_vistos = []
-    for st in streaks:
-        d = st[0].dt.strftime("%d/%m")
-        if d not in dias_vistos:
-            dias_vistos.append(d)
-    cabecera += f" en {', '.join(dias_vistos)}."
-
-    # Para cada racha, generamos su bloque de resumen numerado.
-    bloques_rachas = []
-    for i, streak in enumerate(streaks, start=1):
-        titulo = f"*Ventana {i}* ({len(streak)} h)" if n > 1 else "*Detalle*"
-        bloques_rachas.append(f"{titulo}\n{_summarize_streak(streak)}")
-    bloque_unido = "\n\n".join(bloques_rachas)
-
-    text = (
-        "🏄 *Posibles sesiones de surf*\n\n"
-        f"Spot: {SPOT_NAME}\n"
-        f"Modelo: {model}\n\n"
-        f"{cabecera}\n"
-        f"Criterio: olas de al menos {WAVE_THRESHOLD:.1f} m, periodo de al "
-        f"menos {PERIOD_THRESHOLD:.1f} s y viento por debajo de "
-        f"{WIND_MAX_KMH:.0f} km/h, en horas de luz.\n\n"
-        f"{bloque_unido}\n\n"
-        f"🔗 Ver prevision completa: {SPOT_FORECAST_URL}\n\n"
-        f"Fuente: Open-Meteo (modelo {model})"
-    )
-
+def send_telegram_message(text: str) -> bool:
+    """Envia un mensaje a Telegram. Devuelve True si se envio OK."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning(
             "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID no configurados. "
-            "Mensaje que se enviaria:\n%s",
-            text,
+            "Mensaje que se enviaria:\n%s", text,
         )
         return False
 
@@ -704,11 +681,8 @@ def send_telegram_alert(model: str, streaks: list[list[SurfSlot]]) -> bool:
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown",
-        # Dejamos la preview ACTIVADA: asi el mensaje muestra una tarjeta
-        # clicable de la web de prevision, comoda para abrir de un toque.
         "disable_web_page_preview": False,
     }
-
     try:
         r = requests.post(url, data=payload, timeout=15)
         r.raise_for_status()
@@ -716,7 +690,7 @@ def send_telegram_alert(model: str, streaks: list[list[SurfSlot]]) -> bool:
         if not data.get("ok"):
             log.error("Telegram respondio no-OK: %s", data)
             return False
-        log.info("Alerta Telegram enviada correctamente para modelo %s.", model)
+        log.info("Mensaje de Telegram enviado correctamente.")
         return True
     except requests.RequestException as e:
         log.error("Error enviando Telegram: %s", e)
@@ -727,122 +701,109 @@ def send_telegram_alert(model: str, streaks: list[list[SurfSlot]]) -> bool:
 # ORQUESTADOR
 # ---------------------------------------------------------------------------
 
-def evaluate_and_alert(forecasts: dict[str, ModelForecast]) -> int:
+def evaluate_spot(spot: Spot) -> SpotResult:
     """
-    Evalua cada modelo y envia alerta si procede. Devuelve el numero de
-    alertas enviadas.
+    Evalua un spot completo: descarga aux + cada modelo, filtra desde +lead
+    time, busca rachas por modelo, y calcula la temperatura del agua.
     """
-    alerts = 0
-    start, end = get_target_window()
-    log.info(
-        "Ventana de evaluacion: %s -> %s (pasado manana + dia siguiente)",
-        start.strftime("%Y-%m-%d"),
-        (end - timedelta(seconds=1)).strftime("%Y-%m-%d"),
-    )
-    log.info(
-        "Criterio surfeable: altura >= %.1fm Y periodo >= %.1fs Y "
-        "viento <= %.0fkm/h Y wind wave no domina Y hay luz solar "
-        "(margen +/-%dmin); %d franjas seguidas.",
-        WAVE_THRESHOLD, PERIOD_THRESHOLD, WIND_MAX_KMH,
-        DAYLIGHT_MARGIN_MIN, CONSECUTIVE_SLOTS,
-    )
+    result = SpotResult(spot=spot)
 
-    for model_label in MODELS:
-        forecast = forecasts.get(model_label)
-        if forecast is None or not forecast.slots:
-            log.warning("[%s] Sin datos; se omite este modelo.", model_label)
+    aux = fetch_auxiliary_data(spot)
+
+    forecasts: dict[str, ModelForecast] = {}
+    for model_label, model_id in MODELS.items():
+        try:
+            forecasts[model_label] = fetch_model_forecast(spot, model_label, model_id, aux)
+        except Exception as e:
+            log.error("[%s/%s] No se pudo obtener la prevision: %s", spot.name, model_label, e)
+
+    if not forecasts:
+        log.warning("[%s] Sin datos de ningun modelo.", spot.name)
+        return result
+
+    result.water_temp = representative_water_temp(forecasts)
+
+    for model_label, forecast in forecasts.items():
+        if not forecast.slots:
             continue
-
-        window_slots = filter_slots_for_window(forecast.slots)
+        window_slots = filter_slots_from_now(forecast.slots)
         surfable_count = sum(1 for s in window_slots if s.is_surfable()[0])
         log.info(
-            "[%s] %d franjas en la ventana, %d cumplen el criterio surfeable.",
-            model_label, len(window_slots), surfable_count,
+            "[%s/%s] %d franjas desde +%.0fh, %d surfeables.",
+            spot.name, model_label, len(window_slots), LEAD_TIME_HOURS, surfable_count,
         )
-        if log.isEnabledFor(logging.DEBUG):
-            for s in window_slots:
-                ok, reason = s.is_surfable()
-                log.debug(
-                    "  [%s] %s H=%.2fm T=%.1fs swell=%.2fm wind_wave=%.2fm "
-                    "viento=%s -> %s",
-                    "OK" if ok else "--", s.dt.isoformat(),
-                    s.wave_height, s.wave_period,
-                    s.swell_height if s.swell_height is not None else -1,
-                    s.wind_wave_height if s.wind_wave_height is not None else -1,
-                    f"{s.wind_speed:.0f}km/h" if s.wind_speed is not None else "?",
-                    reason,
-                )
-
         streaks = find_all_surfable_streaks(window_slots)
         if streaks:
-            total_horas = sum(len(s) for s in streaks)
+            result.streaks_by_model[model_label] = streaks
             log.info(
-                "[%s] ✅ %d racha(s) surfeable(s) detectada(s) (%d h en total). "
-                "Primera desde %s.",
-                model_label, len(streaks), total_horas,
-                streaks[0][0].dt.isoformat(),
+                "[%s/%s] ✅ %d racha(s) detectada(s).",
+                spot.name, model_label, len(streaks),
             )
-            if send_telegram_alert(model_label, streaks):
-                alerts += 1
         else:
-            log.info("[%s] ❌ No hay racha surfeable suficiente.", model_label)
+            log.info("[%s/%s] ❌ Sin racha surfeable.", spot.name, model_label)
 
-    return alerts
+    return result
+
+
+def run() -> int:
+    log.info("=== Surf Monitor (Open-Meteo) — %d spots ===", len(SPOTS))
+    log.info("Spots: %s", ", ".join(s.name for s in SPOTS))
+    log.info(
+        "Criterio: altura >= %.1fm, periodo >= %.1fs, viento <= %.0fkm/h, "
+        "luz (margen %dmin), a partir de +%.0fh, %d franjas seguidas.",
+        WAVE_THRESHOLD, PERIOD_THRESHOLD, WIND_MAX_KMH,
+        DAYLIGHT_MARGIN_MIN, LEAD_TIME_HOURS, CONSECUTIVE_SLOTS,
+    )
+
+    messages_sent = 0
+    spots_with_window = 0
+
+    for spot in SPOTS:
+        log.info("--- Evaluando spot: %s ---", spot.name)
+        try:
+            result = evaluate_spot(spot)
+        except Exception as e:
+            log.error("[%s] Error evaluando el spot: %s", spot.name, e)
+            continue
+
+        if result.has_window():
+            spots_with_window += 1
+            message = build_spot_message(result)
+            if send_telegram_message(message):
+                messages_sent += 1
+        else:
+            log.info("[%s] Sin ventana surfeable; no se notifica.", spot.name)
+
+    log.info(
+        "=== Fin. %d spot(s) con ventana, %d mensaje(s) enviado(s). ===",
+        spots_with_window, messages_sent,
+    )
+    return 0
 
 
 def validate_config() -> bool:
-    """
-    Comprueba la configuracion minima. Devuelve True si todo OK.
-    """
+    """Comprueba la configuracion minima. Devuelve True si todo OK."""
     ok = True
-
-    if not SPOT_LATITUDE or not SPOT_LONGITUDE:
-        log.error(
-            "Faltan las coordenadas. Define SPOT_LATITUDE y SPOT_LONGITUDE "
-            "(ej: 41.25 y 2.00)."
-        )
+    if not SPOTS:
+        log.error("No hay spots definidos en la lista SPOTS.")
         ok = False
-    else:
-        try:
-            lat = float(SPOT_LATITUDE)
-            lon = float(SPOT_LONGITUDE)
-            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-                log.error("Coordenadas fuera de rango: lat=%s lon=%s", lat, lon)
-                ok = False
-        except ValueError:
-            log.error(
-                "SPOT_LATITUDE/SPOT_LONGITUDE no son numeros: %s, %s",
-                SPOT_LATITUDE, SPOT_LONGITUDE,
-            )
+    for s in SPOTS:
+        if not (-90 <= s.latitude <= 90) or not (-180 <= s.longitude <= 180):
+            log.error("Spot %s con coordenadas fuera de rango.", s.name)
             ok = False
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning(
             "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID no definidos: el script "
             "funcionara pero NO enviara alertas reales a Telegram."
         )
-
     return ok
 
 
 def main() -> int:
-    log.info("=== Surf Monitor (Open-Meteo) — spot '%s' ===", SPOT_NAME)
-    log.info("Modelos a evaluar: %s", list(MODELS.keys()))
-
     if not validate_config():
         log.error("Configuracion invalida. Abortando.")
         return 2
-
-    try:
-        forecasts = fetch_all_forecasts()
-    except Exception as e:
-        log.error("No se pudo obtener prevision: %s", e)
-        return 2
-
-    log.info("Modelos obtenidos: %s", list(forecasts.keys()))
-    alerts = evaluate_and_alert(forecasts)
-    log.info("=== Ejecucion finalizada. Alertas enviadas: %d ===", alerts)
-    return 0
+    return run()
 
 
 if __name__ == "__main__":
