@@ -547,27 +547,43 @@ def filter_slots_for_window(slots: list[SurfSlot]) -> list[SurfSlot]:
     return filtered
 
 
-def find_surfable_streak(
+def find_all_surfable_streaks(
     slots: list[SurfSlot],
     min_consecutive: int = CONSECUTIVE_SLOTS,
-) -> tuple[bool, list[SurfSlot]]:
+) -> list[list[SurfSlot]]:
     """
-    Devuelve (True, [racha]) si existe al menos una secuencia de
-    'min_consecutive' franjas consecutivas surfeables.
+    Devuelve una lista con TODAS las rachas de 'min_consecutive' o mas franjas
+    consecutivas surfeables encontradas en la lista de slots.
 
-    Como Open-Meteo entrega datos horarios continuos, esto equivale a
-    'min_consecutive' horas seguidas de condiciones surfeables.
+    Cada racha es una lista de SurfSlot consecutivos que cumplen el criterio.
+    Una franja no-surfeable corta la racha; el algoritmo busca la siguiente.
+    Las rachas se devuelven en orden cronologico (la primera de la lista es
+    la mas cercana en el tiempo).
+
+    Si no hay ninguna racha que llegue al minimo, devuelve lista vacia.
+
+    Como Open-Meteo entrega datos horarios continuos, una "racha" equivale a
+    horas consecutivas surfeables sin interrupcion.
     """
-    streak: list[SurfSlot] = []
+    streaks: list[list[SurfSlot]] = []
+    current: list[SurfSlot] = []
+
     for s in slots:
         surfable, _ = s.is_surfable()
         if surfable:
-            streak.append(s)
-            if len(streak) >= min_consecutive:
-                return True, streak
+            current.append(s)
         else:
-            streak = []
-    return False, []
+            # La franja rompe la racha actual: si era larga, la guardamos.
+            if len(current) >= min_consecutive:
+                streaks.append(current)
+            current = []
+
+    # Importante: si la lista de slots TERMINA en medio de una racha, hay
+    # que guardarla tambien (el bucle solo guarda al encontrar una no-surfeable).
+    if len(current) >= min_consecutive:
+        streaks.append(current)
+
+    return streaks
 
 
 # ---------------------------------------------------------------------------
@@ -630,24 +646,47 @@ def _summarize_streak(streak: list[SurfSlot]) -> str:
 # NOTIFICACION A TELEGRAM
 # ---------------------------------------------------------------------------
 
-def send_telegram_alert(model: str, streak: list[SurfSlot]) -> bool:
+def send_telegram_alert(model: str, streaks: list[list[SurfSlot]]) -> bool:
     """
-    Envia el mensaje de alerta a Telegram. Devuelve True si se envio OK.
-    Si no hay credenciales, solo muestra el mensaje por consola.
+    Envia un UNICO mensaje de alerta a Telegram con TODAS las rachas
+    surfeables detectadas por este modelo en la ventana de evaluacion.
+    Devuelve True si se envio OK. Si no hay credenciales, muestra el mensaje
+    por consola.
     """
-    summary = _summarize_streak(streak)
+    if not streaks:
+        return False
+
+    # Cabecera: cuantas rachas se han detectado y dia(s) afectado(s).
+    n = len(streaks)
+    if n == 1:
+        cabecera = "Detectada *1 ventana surfeable*"
+    else:
+        cabecera = f"Detectadas *{n} ventanas surfeables*"
+
+    # Dias unicos cubiertos por las rachas, en orden.
+    dias_vistos = []
+    for st in streaks:
+        d = st[0].dt.strftime("%d/%m")
+        if d not in dias_vistos:
+            dias_vistos.append(d)
+    cabecera += f" en {', '.join(dias_vistos)}."
+
+    # Para cada racha, generamos su bloque de resumen numerado.
+    bloques_rachas = []
+    for i, streak in enumerate(streaks, start=1):
+        titulo = f"*Ventana {i}* ({len(streak)} h)" if n > 1 else "*Detalle*"
+        bloques_rachas.append(f"{titulo}\n{_summarize_streak(streak)}")
+    bloque_unido = "\n\n".join(bloques_rachas)
+
     text = (
-        "🏄 *Posible sesion de surf*\n\n"
+        "🏄 *Posibles sesiones de surf*\n\n"
         f"Spot: {SPOT_NAME}\n"
         f"Modelo: {model}\n\n"
-        f"Detectadas {len(streak)} horas consecutivas surfeables:\n"
-        f"olas de al menos {WAVE_THRESHOLD:.1f} m, periodo de al menos "
-        f"{PERIOD_THRESHOLD:.1f} s y viento por debajo de "
-        f"{WIND_MAX_KMH:.0f} km/h.\n\n"
-        f"{summary}\n\n"
-        "_El Mediterraneo tiene periodo corto; aun asi estas son de las "
-        "mejores ventanas. Confirma el viento antes de ir: offshore (de "
-        "tierra) lo mejora mucho._\n\n"
+        f"{cabecera}\n"
+        f"Criterio: olas de al menos {WAVE_THRESHOLD:.1f} m, periodo de al "
+        f"menos {PERIOD_THRESHOLD:.1f} s y viento por debajo de "
+        f"{WIND_MAX_KMH:.0f} km/h, en horas de luz.\n\n"
+        f"{bloque_unido}\n\n"
         f"🔗 Ver prevision completa: {SPOT_FORECAST_URL}\n\n"
         f"Fuente: Open-Meteo (modelo {model})"
     )
@@ -734,13 +773,16 @@ def evaluate_and_alert(forecasts: dict[str, ModelForecast]) -> int:
                     reason,
                 )
 
-        triggered, streak = find_surfable_streak(window_slots)
-        if triggered:
+        streaks = find_all_surfable_streaks(window_slots)
+        if streaks:
+            total_horas = sum(len(s) for s in streaks)
             log.info(
-                "[%s] ✅ Racha surfeable: %d horas desde %s.",
-                model_label, len(streak), streak[0].dt.isoformat(),
+                "[%s] ✅ %d racha(s) surfeable(s) detectada(s) (%d h en total). "
+                "Primera desde %s.",
+                model_label, len(streaks), total_horas,
+                streaks[0][0].dt.isoformat(),
             )
-            if send_telegram_alert(model_label, streak):
+            if send_telegram_alert(model_label, streaks):
                 alerts += 1
         else:
             log.info("[%s] ❌ No hay racha surfeable suficiente.", model_label)
