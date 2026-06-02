@@ -13,7 +13,7 @@ Telegram con un mensaje por cada spot que tenga olas.
 FUENTE DE DATOS
     API publica y gratuita de Open-Meteo, dos endpoints:
       - Marine API   : oleaje (altura, periodo, swell, wind wave) + temperatura
-                       del agua (sea_surface_temperature).
+                       del agua (sea_surface_temperature, sin forzar modelo).
       - Forecast API : viento (velocidad y direccion) + orto/ocaso.
     Los modelos de oleaje son los del servicio aleman DWD: EWAM (Europa, alta
     resolucion 5 km) y GWAM (global). Son los mismos que Windguru etiqueta como
@@ -155,12 +155,17 @@ MODELS: dict[str, str] = {
 MARINE_API_URL: str = "https://marine-api.open-meteo.com/v1/marine"
 FORECAST_API_URL: str = "https://api.open-meteo.com/v1/forecast"
 
-# Variables de oleaje que pedimos a la Marine API (incluye temperatura del agua).
+# Variables de oleaje que pedimos a la Marine API POR MODELO (EWAM/GWAM).
+# OJO: la temperatura del agua (sea_surface_temperature) NO la traen EWAM ni
+# GWAM (solo dan oleaje). La pedimos aparte, sin forzar modelo, mas abajo.
 MARINE_HOURLY_VARS: str = (
     "wave_height,wave_period,wave_direction,"
     "swell_wave_height,swell_wave_period,"
-    "wind_wave_height,sea_surface_temperature"
+    "wind_wave_height"
 )
+# Variable de temperatura del agua. Se pide SIN forzar modelo, para que
+# Open-Meteo use su "best match" (MeteoFrance), que es quien provee la SST.
+MARINE_SST_VAR: str = "sea_surface_temperature"
 # Variables de la Forecast API: solo viento.
 FORECAST_HOURLY_VARS: str = "wind_speed_10m,wind_direction_10m"
 
@@ -187,13 +192,16 @@ log = logging.getLogger("surf_monitor")
 class AuxiliaryData:
     """
     Datos auxiliares comunes a todos los modelos de UN spot (no dependen del
-    modelo de oleaje), de la Forecast API:
-      - wind_map: viento horario por timestamp ISO.
+    modelo de oleaje):
+      - wind_map: viento horario por timestamp ISO (de la Forecast API).
       - daylight_by_date: por fecha, (inicio_luz, fin_luz) con margen aplicado.
-    Si la llamada falla, las estructuras quedan vacias (criterio conservador).
+      - water_temp_map: temperatura del agua por timestamp ISO (de la Marine
+        API sin forzar modelo; la SST la provee MeteoFrance, no EWAM/GWAM).
+    Si una llamada falla, su estructura queda vacia (criterio conservador).
     """
     wind_map: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     daylight_by_date: dict[str, tuple[datetime, datetime]] = field(default_factory=dict)
+    water_temp_map: dict[str, float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -404,6 +412,32 @@ def fetch_auxiliary_data(spot: Spot) -> AuxiliaryData:
         "[%s] Viento: %d franjas. Luz solar: %d dias.",
         label, len(aux.wind_map), len(aux.daylight_by_date),
     )
+
+    # --- Temperatura del agua (SST) ---
+    # Se pide a la Marine API SIN forzar modelo, para que use "best match"
+    # (MeteoFrance), que es quien provee la SST. EWAM/GWAM no la traen.
+    sst_params = {
+        "latitude": spot.latitude,
+        "longitude": spot.longitude,
+        "hourly": MARINE_SST_VAR,
+        "forecast_days": 4,
+        "timezone": TIMEZONE,
+        "cell_selection": "sea",
+    }
+    sst_label = f"{spot.name}/sst"
+    try:
+        log.info("[%s] Consultando temperatura del agua...", sst_label)
+        sst_payload = _request_with_retries(MARINE_API_URL, sst_params, sst_label)
+        sst_hourly = sst_payload.get("hourly", {})
+        sst_times = sst_hourly.get("time", [])
+        sst_vals = sst_hourly.get("sea_surface_temperature", [])
+        for i, t in enumerate(sst_times):
+            aux.water_temp_map[t] = _safe_get(sst_vals, i)
+        con_dato = sum(1 for v in aux.water_temp_map.values() if v is not None)
+        log.info("[%s] Temperatura del agua: %d franjas con dato.", sst_label, con_dato)
+    except Exception as e:
+        log.warning("[%s] No se pudo obtener temperatura del agua (no critico): %s", sst_label, e)
+
     return aux
 
 
@@ -444,7 +478,8 @@ def fetch_model_forecast(spot: Spot, model_label: str, model_id: str, aux: Auxil
     h_swell_h = hourly.get("swell_wave_height", [])
     h_swell_p = hourly.get("swell_wave_period", [])
     h_wind_w = hourly.get("wind_wave_height", [])
-    h_water = hourly.get("sea_surface_temperature", [])
+    # La temperatura del agua NO se lee aqui: viene del mapa de aux (SST se
+    # pide aparte, sin forzar modelo, porque EWAM/GWAM no la traen).
 
     if not times or not h_wave:
         log.warning("[%s] Faltan 'time' o 'wave_height'.", label)
@@ -465,6 +500,7 @@ def fetch_model_forecast(spot: Spot, model_label: str, model_id: str, aux: Auxil
             continue
 
         wind_speed, wind_dir = aux.wind_map.get(t, (None, None))
+        water_temp = aux.water_temp_map.get(t)
 
         date_key = slot_dt.strftime("%Y-%m-%d")
         daylight_range = aux.daylight_by_date.get(date_key)
@@ -482,7 +518,7 @@ def fetch_model_forecast(spot: Spot, model_label: str, model_id: str, aux: Auxil
             swell_height=_safe_get(h_swell_h, i),
             swell_period=_safe_get(h_swell_p, i),
             wind_wave_height=_safe_get(h_wind_w, i),
-            water_temp=_safe_get(h_water, i),
+            water_temp=water_temp,
             wind_speed=wind_speed,
             wind_direction=wind_dir,
             is_daylight=is_daylight,
@@ -548,21 +584,25 @@ def find_all_surfable_streaks(
     return streaks
 
 
-def representative_water_temp(forecasts: dict[str, ModelForecast], reference: datetime | None = None) -> float | None:
+def representative_water_temp(aux: AuxiliaryData, reference: datetime | None = None) -> float | None:
     """
-    Temperatura del agua representativa para el spot: la del primer slot futuro
-    con dato (la mas cercana en el tiempo a partir de la ventana de busqueda).
+    Temperatura del agua representativa para el spot: la del primer timestamp
+    futuro con dato (la mas cercana a la ventana de busqueda). Se lee del mapa
+    de datos auxiliares (la SST se pide sin forzar modelo).
     """
     start = get_search_start(reference)
-    for forecast in forecasts.values():
-        for s in sorted(forecast.slots, key=lambda x: x.dt):
-            if s.dt >= start and s.water_temp is not None:
-                return s.water_temp
-    # Si no hay nada futuro, probar cualquier dato disponible.
-    for forecast in forecasts.values():
-        for s in forecast.slots:
-            if s.water_temp is not None:
-                return s.water_temp
+    # Recorremos los timestamps ordenados buscando el primero futuro con dato.
+    for t in sorted(aux.water_temp_map.keys()):
+        try:
+            tdt = datetime.fromisoformat(t)
+        except ValueError:
+            continue
+        if tdt >= start and aux.water_temp_map[t] is not None:
+            return aux.water_temp_map[t]
+    # Si no hay nada futuro, devolvemos cualquier dato disponible.
+    for v in aux.water_temp_map.values():
+        if v is not None:
+            return v
     return None
 
 
@@ -848,7 +888,7 @@ def evaluate_spot(spot: Spot) -> SpotResult:
         log.warning("[%s] Sin datos de ningun modelo.", spot.name)
         return result
 
-    result.water_temp = representative_water_temp(forecasts)
+    result.water_temp = representative_water_temp(aux)
 
     for model_label, forecast in forecasts.items():
         if not forecast.slots:
