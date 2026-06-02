@@ -292,24 +292,25 @@ class SpotResult:
 
 def wetsuit_recommendation(water_temp: float | None) -> str:
     """
-    Devuelve una recomendacion de neopreno en texto segun la temperatura del
-    agua, pensada para una sesion larga (2-3 h). Si no hay dato, lo indica.
+    Devuelve una recomendacion de neopreno (solo la prenda, sin repetir la
+    temperatura) segun la temperatura del agua, pensada para una sesion larga
+    de 2-3 h. Si no hay dato, devuelve cadena vacia (el llamador lo gestiona).
     """
     if water_temp is None:
-        return "sin dato de temperatura del agua"
+        return ""
 
     t = water_temp
     if t >= 24:
-        return f"agua ~{t:.0f}C: lycra o sin neopreno (a lo sumo top de 1-2 mm)"
+        return "lycra o sin neopreno"
     if t >= 22:
-        return f"agua ~{t:.0f}C: shorty 2 mm o neopreno corto"
+        return "shorty 2 mm"
     if t >= 19:
-        return f"agua ~{t:.0f}C: neopreno 3/2 mm"
+        return "neopreno 3/2 mm"
     if t >= 16:
-        return f"agua ~{t:.0f}C: neopreno 4/3 mm (valora escarpines)"
+        return "neopreno 4/3 mm + escarpines"
     if t >= 13:
-        return f"agua ~{t:.0f}C: neopreno 5/4 mm + escarpines; guantes y capucha si aguantas 2-3 h"
-    return f"agua ~{t:.0f}C: 5/4 mm o mas, con capucha, guantes y escarpines (sesion larga exige abrigo extra)"
+        return "neopreno 5/4 mm, escarpines y capucha"
+    return "5/4 mm con capucha, guantes y escarpines"
 
 
 # ---------------------------------------------------------------------------
@@ -579,86 +580,212 @@ def _degrees_to_compass(deg: float | None) -> str:
     return dirs[idx]
 
 
-def _summarize_streak(streak: list[SurfSlot]) -> str:
-    """Resumen legible de una racha para el mensaje de Telegram."""
-    first, last = streak[0], streak[-1]
+# Dias de la semana en castellano abreviados (datetime.weekday(): 0 = lunes).
+_WEEKDAYS_ES = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"]
+
+
+@dataclass
+class _Window:
+    """
+    Representacion intermedia de una ventana surfeable, ya resumida y lista
+    para pintar. Agrupa una o varias rachas (de uno o varios modelos) que se
+    solapan en el tiempo el mismo dia.
+    """
+    start: datetime
+    end: datetime
+    h_min: float
+    h_max: float
+    p_min: float
+    p_max: float
+    wind_kmh: float | None
+    wind_dir: float | None
+    wave_dir: float | None
+    quality: str            # "limpio" / "picado" / "mixto"
+    models: set[str]        # modelos que la respaldan
+
+
+def _streak_to_window(streak: list[SurfSlot], model: str) -> _Window:
+    """Convierte una racha cruda en una _Window resumida."""
     heights = [s.wave_height for s in streak]
     periods = [s.wave_period for s in streak]
-
-    labels = [s.quality_label() for s in streak]
-    if labels.count("limpio") > labels.count("picado"):
-        quality = "mar limpio (predomina el swell de fondo)"
-    elif labels.count("picado") > labels.count("limpio"):
-        quality = "mar algo movido (presencia de oleaje de viento)"
-    else:
-        quality = "mar mixto (swell y viento parejos)"
-
     winds = [s.wind_speed for s in streak if s.wind_speed is not None]
-    if winds:
-        wind_avg = sum(winds) / len(winds)
-        mid_dir = streak[len(streak) // 2].wind_direction
-        wind_txt = f"{wind_avg:.0f} km/h del {_degrees_to_compass(mid_dir)}"
+    labels = [s.quality_label() for s in streak]
+
+    if labels.count("limpio") >= labels.count("picado"):
+        quality = "limpio" if labels.count("limpio") >= labels.count("mixto") else "mixto"
     else:
-        wind_txt = "sin dato"
+        quality = "picado"
 
-    mid_wavedir = streak[len(streak) // 2].wave_direction
-    wavedir_txt = _degrees_to_compass(mid_wavedir)
+    mid = len(streak) // 2
+    return _Window(
+        start=streak[0].dt,
+        end=streak[-1].dt,
+        h_min=min(heights),
+        h_max=max(heights),
+        p_min=min(periods),
+        p_max=max(periods),
+        wind_kmh=(sum(winds) / len(winds)) if winds else None,
+        wind_dir=streak[mid].wind_direction,
+        wave_dir=streak[mid].wave_direction,
+        quality=quality,
+        models={model},
+    )
 
-    lines = [
-        f"  Franja: {first.dt:%H:%M} - {last.dt:%H:%M} del {first.dt:%d/%m}",
-        f"  Altura: {min(heights):.2f} - {max(heights):.2f} m",
-        f"  Periodo: {min(periods):.1f} - {max(periods):.1f} s",
-        f"  Direccion de la ola: viene del {wavedir_txt}",
-        f"  Calidad: {quality}",
-        f"  Viento: {wind_txt}",
-    ]
-    return "\n".join(lines)
+
+def _overlaps(a: _Window, b: _Window) -> bool:
+    """True si dos ventanas se solapan en el tiempo (mismo evento de mar)."""
+    return a.start <= b.end and b.start <= a.end
+
+
+def _merge_windows(a: _Window, b: _Window) -> _Window:
+    """Fusiona dos ventanas solapadas, uniendo rangos y modelos."""
+    return _Window(
+        start=min(a.start, b.start),
+        end=max(a.end, b.end),
+        h_min=min(a.h_min, b.h_min),
+        h_max=max(a.h_max, b.h_max),
+        p_min=min(a.p_min, b.p_min),
+        p_max=max(a.p_max, b.p_max),
+        # Viento y direccion: nos quedamos con los de la ventana mas larga.
+        wind_kmh=a.wind_kmh if (a.end - a.start) >= (b.end - b.start) else b.wind_kmh,
+        wind_dir=a.wind_dir if (a.end - a.start) >= (b.end - b.start) else b.wind_dir,
+        wave_dir=a.wave_dir if (a.end - a.start) >= (b.end - b.start) else b.wave_dir,
+        # Calidad: si alguna es "picado", lo reflejamos (mas conservador).
+        quality="picado" if "picado" in (a.quality, b.quality) else (
+            "limpio" if "limpio" in (a.quality, b.quality) else "mixto"
+        ),
+        models=a.models | b.models,
+    )
+
+
+def _collect_and_merge_windows(result: SpotResult) -> list[_Window]:
+    """
+    Toma todas las rachas de todos los modelos del spot, las convierte en
+    _Window, y fusiona las que se solapan en el tiempo (aunque vengan de
+    modelos distintos). Devuelve la lista final ordenada cronologicamente.
+    """
+    raw: list[_Window] = []
+    for model_label, streaks in result.streaks_by_model.items():
+        for streak in streaks:
+            raw.append(_streak_to_window(streak, model_label))
+
+    # Fusion iterativa: mientras encontremos solapamientos, fusionamos.
+    raw.sort(key=lambda w: w.start)
+    merged: list[_Window] = []
+    for w in raw:
+        fusion_hecha = False
+        for i, m in enumerate(merged):
+            if _overlaps(w, m):
+                merged[i] = _merge_windows(m, w)
+                fusion_hecha = True
+                break
+        if not fusion_hecha:
+            merged.append(w)
+
+    merged.sort(key=lambda w: w.start)
+    return merged
+
+
+def _quality_icon(quality: str) -> str:
+    """Icono representativo de la calidad del mar."""
+    return {"limpio": "🟢", "picado": "🟠", "mixto": "🟡"}.get(quality, "🟡")
+
+
+def _format_window_line(w: _Window) -> list[str]:
+    """
+    Devuelve las 2 lineas compactas que representan una ventana:
+      - Linea 1: horario, duracion y confianza (modelos que coinciden).
+      - Linea 2: tamano, periodo, calidad y viento, con iconos como anclas.
+    """
+    horas = int(round((w.end - w.start).total_seconds() / 3600)) + 1
+    # Confianza segun cuantos modelos coinciden.
+    if len(w.models) >= 2:
+        confianza = "✅ coinciden EWAM y GWAM"
+    else:
+        modelo = next(iter(w.models))
+        confianza = f"· solo {modelo}"
+
+    linea1 = f"🕐 {w.start:%H:%M}–{w.end:%H:%M}  ({horas} h)  {confianza}"
+
+    # Tamano: si el rango es estrecho, mostramos un solo valor.
+    if w.h_max - w.h_min < 0.1:
+        alt = f"{w.h_max:.1f} m"
+    else:
+        alt = f"{w.h_min:.1f}–{w.h_max:.1f} m"
+    # Periodo. Mostramos un solo valor si al redondear coinciden.
+    if round(w.p_min) == round(w.p_max):
+        per = f"{w.p_max:.0f} s"
+    else:
+        per = f"{w.p_min:.0f}–{w.p_max:.0f} s"
+    # Viento.
+    if w.wind_kmh is not None:
+        viento = f"{w.wind_kmh:.0f} km/h {_degrees_to_compass(w.wind_dir)}"
+    else:
+        viento = "s/d"
+
+    icono = _quality_icon(w.quality)
+    linea2 = f"     🌊 {alt}  ·  ⏱ {per}  ·  💨 {viento}  ·  {icono}"
+
+    return [linea1, linea2]
 
 
 def build_spot_message(result: SpotResult) -> str:
     """
-    Construye el mensaje de Telegram para UN spot, combinando los dos modelos
-    (EWAM y GWAM) y anadiendo temperatura del agua y recomendacion de neopreno.
+    Construye el mensaje de Telegram para UN spot. Diseno orientado a lectura
+    rapida en movil: cabecera con lo esencial, ventanas agrupadas por dia,
+    una linea de datos por ventana con iconos como anclas visuales, y los dos
+    modelos fusionados (la coincidencia entre modelos = senal de confianza).
     """
     spot = result.spot
 
-    # Cabecera con temperatura del agua y neopreno.
+    windows = _collect_and_merge_windows(result)
+    if not windows:
+        # No deberia pasar (solo se llama si hay ventana), pero por seguridad.
+        return f"🏄 {spot.name}: condiciones surfeables detectadas."
+
+    # Dias unicos cubiertos, en orden.
+    dias = []
+    for w in windows:
+        clave = w.start.date()
+        if clave not in dias:
+            dias.append(clave)
+
+    # --- CABECERA: lo esencial de un vistazo ---
     temp = result.water_temp
-    temp_txt = f"{temp:.0f}C" if temp is not None else "sin dato"
-    wetsuit = wetsuit_recommendation(temp)
+    n_ventanas = len(windows)
+    resumen_ventanas = "1 ventana" if n_ventanas == 1 else f"{n_ventanas} ventanas"
+    if len(dias) == 1:
+        resumen_dias = "en 1 dia"
+    else:
+        resumen_dias = f"en {len(dias)} dias"
 
     partes = [
-        "🏄 *Ventana de surf detectada*",
-        "",
-        f"Spot: *{spot.name}*",
-        f"Agua: {temp_txt}",
-        f"Neopreno (sesion 2-3 h): {wetsuit}",
-        "",
-        f"Criterio: olas >= {WAVE_THRESHOLD:.1f} m, periodo >= "
-        f"{PERIOD_THRESHOLD:.1f} s, viento < {WIND_MAX_KMH:.0f} km/h, con luz, "
-        f"a partir de +{LEAD_TIME_HOURS:.0f} h.",
+        f"🏄 *SURF · {spot.name.upper()}*",
+        f"{resumen_ventanas} {resumen_dias}",
     ]
 
-    # Bloque por cada modelo que tenga rachas.
-    for model_label in MODELS:
-        streaks = result.streaks_by_model.get(model_label, [])
-        if not streaks:
-            continue
-        partes.append("")
-        n = len(streaks)
-        if n == 1:
-            partes.append(f"*Modelo {model_label}* — 1 ventana:")
-        else:
-            partes.append(f"*Modelo {model_label}* — {n} ventanas:")
-        for i, streak in enumerate(streaks, start=1):
-            etiqueta = f"  Ventana {i} ({len(streak)} h)" if n > 1 else f"  ({len(streak)} h)"
-            partes.append(etiqueta)
-            partes.append(_summarize_streak(streak))
+    if temp is not None:
+        partes.append(f"🌡 Agua {temp:.0f}°C  ·  🧴 {wetsuit_recommendation(temp)}")
+    else:
+        partes.append("🌡 Agua: sin dato  ·  🧴 lleva el de siempre")
+    partes.append("━━━━━━━━━━━━━━━━━━━")
 
+    # --- CUERPO: ventanas agrupadas por dia ---
+    dia_actual = None
+    for w in windows:
+        clave = w.start.date()
+        if clave != dia_actual:
+            dia_actual = clave
+            dow = _WEEKDAYS_ES[w.start.weekday()]
+            partes.append("")  # separacion entre dias
+            partes.append(f"📅 *{dow} {w.start:%d/%m}*")
+        partes.extend(_format_window_line(w))
+
+    # --- PIE: leyenda minima + enlace ---
     partes.append("")
-    partes.append(f"🔗 Ver prevision completa: {spot.forecast_url}")
-    partes.append("")
-    partes.append("Fuente: Open-Meteo (modelos EWAM y GWAM, DWD)")
+    partes.append("━━━━━━━━━━━━━━━━━━━")
+    partes.append("🟢 limpio · 🟡 mixto · 🟠 movido")
+    partes.append(f"🔗 [Ver previsión completa]({spot.forecast_url})")
 
     return "\n".join(partes)
 
