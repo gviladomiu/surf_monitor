@@ -65,6 +65,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -726,106 +727,129 @@ def _collect_and_merge_windows(result: SpotResult) -> list[_Window]:
     return merged
 
 
-def _quality_icon(quality: str) -> str:
-    """Icono representativo de la calidad del mar."""
-    return {"limpio": "🟢", "picado": "🟠", "mixto": "🟡"}.get(quality, "🟡")
-
-
-def _format_window_line(w: _Window) -> list[str]:
-    """
-    Devuelve las 2 lineas compactas que representan una ventana:
-      - Linea 1: horario, duracion y confianza (modelos que coinciden).
-      - Linea 2: tamano, periodo, calidad y viento, con iconos como anclas.
-    """
-    horas = int(round((w.end - w.start).total_seconds() / 3600)) + 1
-    # Confianza segun cuantos modelos coinciden.
-    if len(w.models) >= 2:
-        confianza = "✅ coinciden EWAM y GWAM"
-    else:
-        modelo = next(iter(w.models))
-        confianza = f"· solo {modelo}"
-
-    linea1 = f"🕐 {w.start:%H:%M}–{w.end:%H:%M}  ({horas} h)  {confianza}"
-
-    # Tamano: si el rango es estrecho, mostramos un solo valor.
+def _format_height_range(w: _Window) -> str:
+    """Formato minimalista para el rango de altura."""
     if w.h_max - w.h_min < 0.1:
-        alt = f"{w.h_max:.1f} m"
-    else:
-        alt = f"{w.h_min:.1f}–{w.h_max:.1f} m"
-    # Periodo. Mostramos un solo valor si al redondear coinciden.
+        return f"{w.h_max:.1f} m"
+    return f"{w.h_min:.1f}–{w.h_max:.1f} m"
+
+
+def _format_period_range(w: _Window) -> str:
+    """Formato minimalista para el rango de periodo."""
     if round(w.p_min) == round(w.p_max):
-        per = f"{w.p_max:.0f} s"
-    else:
-        per = f"{w.p_min:.0f}–{w.p_max:.0f} s"
-    # Viento.
-    if w.wind_kmh is not None:
-        viento = f"{w.wind_kmh:.0f} km/h {_degrees_to_compass(w.wind_dir)}"
-    else:
-        viento = "s/d"
+        return f"{w.p_max:.0f} s"
+    return f"{w.p_min:.0f}–{w.p_max:.0f} s"
 
-    icono = _quality_icon(w.quality)
-    linea2 = f"     🌊 {alt}  ·  ⏱ {per}  ·  💨 {viento}  ·  {icono}"
 
-    return [linea1, linea2]
+def _format_wind(w: _Window) -> str:
+    """Formato minimalista para viento."""
+    if w.wind_kmh is None:
+        return "s/d"
+    return f"{w.wind_kmh:.0f} km/h {_degrees_to_compass(w.wind_dir)}"
+
+
+def _format_confidence(w: _Window) -> str:
+    """Texto de confianza segun los modelos que respaldan la ventana."""
+    if len(w.models) >= 2:
+        return "EWAM + GWAM"
+    return f"solo {next(iter(w.models))}"
+
+
+def _format_day_label(dt: datetime) -> str:
+    """Etiqueta de dia pensada para lectura rapida en Telegram."""
+    try:
+        today = datetime.now(ZoneInfo(TIMEZONE)).date()
+    except Exception:
+        today = datetime.now().date()
+
+    if dt.date() == today:
+        return "Hoy"
+    if dt.date() == today + timedelta(days=1):
+        return "Mañana"
+
+    weekday = _WEEKDAYS_ES[dt.weekday()].capitalize()
+    return f"{weekday} {dt:%d/%m}"
+
+
+def _format_water_line(temp: float | None) -> str:
+    """Linea final con temperatura y neopreno, sin iconos."""
+    if temp is None:
+        return "Agua: sin dato · lleva el de siempre"
+    return f"Agua {temp:.0f} °C · {wetsuit_recommendation(temp)}"
+
+
+def _format_single_window_message(spot: Spot, w: _Window, temp: float | None) -> str:
+    """Mensaje minimalista para un spot con una unica ventana."""
+    day_label = _format_day_label(w.start)
+    day_prefix = "Hoy" if day_label == "Hoy" else day_label
+
+    return "\n".join([
+        f"{spot.name} · Buena ventana",
+        "",
+        f"{day_prefix} de {w.start:%H:%M} a {w.end:%H:%M}",
+        "",
+        f"Olas: {_format_height_range(w)}",
+        f"Periodo: {_format_period_range(w)}",
+        f"Viento: {_format_wind(w)}",
+        f"Mar: {w.quality}",
+        f"Confianza: {_format_confidence(w)}",
+        "",
+        _format_water_line(temp),
+        "",
+        spot.forecast_url,
+    ])
+
+
+def _format_multi_window_block(w: _Window, include_day: bool = True) -> list[str]:
+    """Bloque compacto para una ventana cuando hay varias."""
+    lines: list[str] = []
+    if include_day:
+        lines.append(_format_day_label(w.start))
+    lines.extend([
+        f"{w.start:%H:%M}–{w.end:%H:%M}",
+        (
+            f"{_format_height_range(w)} · "
+            f"{_format_period_range(w)} · "
+            f"{_format_wind(w)}"
+        ),
+        f"{w.quality.capitalize()} · {_format_confidence(w)}",
+    ])
+    return lines
 
 
 def build_spot_message(result: SpotResult) -> str:
     """
-    Construye el mensaje de Telegram para UN spot. Diseno orientado a lectura
-    rapida en movil: cabecera con lo esencial, ventanas agrupadas por dia,
-    una linea de datos por ventana con iconos como anclas visuales, y los dos
-    modelos fusionados (la coincidencia entre modelos = senal de confianza).
+    Construye el mensaje de Telegram para UN spot con una UX minimalista:
+    sin iconos, sin separadores visuales y con foco en decision rapida.
     """
     spot = result.spot
-
     windows = _collect_and_merge_windows(result)
+
     if not windows:
         # No deberia pasar (solo se llama si hay ventana), pero por seguridad.
-        return f"🏄 {spot.name}: condiciones surfeables detectadas."
+        return f"{spot.name}: condiciones surfeables detectadas.\n\n{spot.forecast_url}"
 
-    # Dias unicos cubiertos, en orden.
-    dias = []
-    for w in windows:
-        clave = w.start.date()
-        if clave not in dias:
-            dias.append(clave)
-
-    # --- CABECERA: lo esencial de un vistazo ---
     temp = result.water_temp
-    n_ventanas = len(windows)
-    resumen_ventanas = "1 ventana" if n_ventanas == 1 else f"{n_ventanas} ventanas"
-    if len(dias) == 1:
-        resumen_dias = "en 1 dia"
-    else:
-        resumen_dias = f"en {len(dias)} dias"
 
-    partes = [
-        f"🏄 *SURF · {spot.name.upper()}*",
-        f"{resumen_ventanas} {resumen_dias}",
+    if len(windows) == 1:
+        return _format_single_window_message(spot, windows[0], temp)
+
+    partes: list[str] = [
+        f"{spot.name} · {len(windows)} ventanas",
+        "",
     ]
 
-    if temp is not None:
-        partes.append(f"🌡 Agua {temp:.0f}°C  ·  🧴 {wetsuit_recommendation(temp)}")
-    else:
-        partes.append("🌡 Agua: sin dato  ·  🧴 lleva el de siempre")
-    partes.append("━━━━━━━━━━━━━━━━━━━")
+    for i, w in enumerate(windows):
+        if i > 0:
+            partes.append("")
+        partes.extend(_format_multi_window_block(w))
 
-    # --- CUERPO: ventanas agrupadas por dia ---
-    dia_actual = None
-    for w in windows:
-        clave = w.start.date()
-        if clave != dia_actual:
-            dia_actual = clave
-            dow = _WEEKDAYS_ES[w.start.weekday()]
-            partes.append("")  # separacion entre dias
-            partes.append(f"📅 *{dow} {w.start:%d/%m}*")
-        partes.extend(_format_window_line(w))
-
-    # --- PIE: leyenda minima + enlace ---
-    partes.append("")
-    partes.append("━━━━━━━━━━━━━━━━━━━")
-    partes.append("🟢 limpio · 🟡 mixto · 🟠 movido")
-    partes.append(f"🔗 [Ver previsión completa]({spot.forecast_url})")
+    partes.extend([
+        "",
+        _format_water_line(temp),
+        "",
+        spot.forecast_url,
+    ])
 
     return "\n".join(partes)
 
