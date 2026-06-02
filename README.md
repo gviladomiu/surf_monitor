@@ -4,7 +4,7 @@ Monitor automático de condiciones de **surf** para varios spots de la costa de
 Barcelona: **Castelldefels, Masnou y Sitges**. Cada 6 horas revisa la previsión
 de cada spot, evalúa si hay una ventana surfeable **a partir de las próximas
 3 horas** (el tiempo que necesitas para llegar en coche), y avisa por
-**Telegram** con un mensaje por cada spot que tenga olas.
+**Telegram** con un mensaje claro por cada spot que tenga olas.
 
 Se ejecuta enteramente en **GitHub Actions**: sin servidor, sin consola, sin
 instalar nada en tu ordenador.
@@ -27,14 +27,14 @@ si hay luz para verla. Por eso este monitor mira **cinco condiciones a la vez**:
 5. **Hay luz solar** — calculado con el orto y el ocaso reales de cada día,
    con un margen de 30 min a cada lado. No se puede surfear de noche.
 
-Además, solo se consideran franjas **a partir de ahora + 3 horas** (el tiempo
-de desplazamiento al spot). No tiene sentido avisarte de una ventana que
-empieza en 30 minutos si no te da tiempo a llegar.
+Además, solo se consideran franjas **a partir de ahora + 3 horas**: no tiene
+sentido avisarte de una ventana que empieza en 30 minutos si no te da tiempo a
+coger el coche y llegar.
 
 Si hay **3 horas consecutivas** que cumplen las cinco condiciones, el spot
-tiene una ventana, y recibes un mensaje. El mensaje incluye:
-- Las ventanas detectadas por **cada modelo** (EWAM y GWAM), combinadas en
-  un solo mensaje por spot.
+tiene una ventana, y recibes un mensaje que incluye:
+- Las ventanas detectadas, **agrupadas por día** y con los dos modelos
+  (EWAM y GWAM) fusionados (cuando coinciden, es señal de confianza).
 - La **temperatura del agua** y una **recomendación de neopreno** para una
   sesión de 2-3 h.
 - Un **enlace a la previsión visual** del spot en Windguru.
@@ -48,8 +48,8 @@ tiene una ventana, y recibes un mensaje. El mensaje incluye:
 
 ## 📍 Spots monitorizados
 
-| Spot           | Coordenadas (mar adentro) | Previsión visual |
-|----------------|---------------------------|------------------|
+| Spot           | Coordenadas (mar adentro) | Previsión visual   |
+|----------------|---------------------------|--------------------|
 | Castelldefels  | 41.25, 2.00               | windguru.cz/201    |
 | Masnou         | 41.474775, 2.305556       | windguru.cz/501030 |
 | Sitges         | 41.234065, 1.820438       | windguru.cz/48885  |
@@ -75,7 +75,27 @@ clave de API. Los enlaces de las alertas apuntan a Windguru solo porque su
 vista gráfica es cómoda para confirmar las condiciones de un vistazo.
 
 > **Atribución.** Datos de Open-Meteo bajo licencia CC BY 4.0, generados a
-> partir de los modelos del Deutscher Wetterdienst (DWD).
+> partir de los modelos del Deutscher Wetterdienst (DWD), y temperatura del
+> agua de MeteoFrance (vía Copernicus Marine).
+
+---
+
+## 🌡 De dónde sale cada dato
+
+El monitor combina **tres fuentes** de Open-Meteo, porque ningún modelo único
+las tiene todas:
+
+| Dato                        | Fuente / endpoint                              |
+|-----------------------------|------------------------------------------------|
+| Oleaje (altura, periodo, swell, viento-ola) | Marine API, modelos DWD **EWAM** y **GWAM** |
+| **Temperatura del agua**    | Marine API, sin forzar modelo (la provee **MeteoFrance**) |
+| Viento (velocidad/dirección)| Forecast API |
+| Orto y ocaso                | Forecast API (`sunrise`, `sunset`) |
+
+> ℹ️ Detalle técnico importante: la temperatura del agua **no** la traen los
+> modelos EWAM/GWAM (solo dan oleaje). Por eso se pide en una llamada aparte,
+> sin forzar modelo, para que Open-Meteo use MeteoFrance. Si se pidiera junto
+> al oleaje, devolvería siempre vacío.
 
 ---
 
@@ -136,7 +156,12 @@ Desde [Telegram Web](https://web.telegram.org), sin tocar el móvil:
      y `README.md` con la opción **uploading an existing file**.
    - Para el workflow, usa **Add file → Create new file** y escribe como
      nombre la ruta completa `.github/workflows/surf-monitor.yml`
-     (las barras `/` crean las carpetas). Pega el contenido y confirma.
+     (las barras `/` crean las carpetas). Pega el contenido **una sola vez**
+     y confirma.
+
+> ⚠️ Si al guardar el workflow te da un error tipo *"'concurrency' is already
+> defined"* o *"'jobs' is already defined"*, es que el contenido quedó pegado
+> dos veces. Vacía el archivo por completo (Ctrl+A, borrar) y pega una sola vez.
 
 ---
 
@@ -161,9 +186,24 @@ New repository secret**. Crea estos **dos** secretos:
 3. Pulsa **Run workflow → Run workflow**.
 4. Abre la ejecución para ver los logs en tiempo real.
 
-Verás en el log cómo evalúa los tres spots uno por uno. "0 mensajes enviados"
-es **lo normal** la mayoría de los días: no hay ventanas surfeables. Cuando las
-haya, recibirás un mensaje por cada spot que las tenga.
+En el log verás cómo evalúa los tres spots uno por uno. Fíjate en estas líneas
+para confirmar que todo va bien:
+
+```
+--- Evaluando spot: Castelldefels ---
+[Castelldefels/aux] Consultando Forecast API (viento + sol)...
+[Castelldefels/aux] Viento: 96 franjas. Luz solar: 4 dias.
+[Castelldefels/sst] Consultando temperatura del agua...
+[Castelldefels/sst] Temperatura del agua: 96 franjas con dato.   <-- debe ser > 0
+[Castelldefels/EWAM] Obtenidas 96 franjas con datos completos.
+[Castelldefels/GWAM] Obtenidas 96 franjas con datos completos.
+[Castelldefels/EWAM] ❌ Sin racha surfeable.
+...
+=== Fin. 0 spot(s) con ventana, 0 mensaje(s) enviado(s). ===
+```
+
+"0 mensajes" es **lo normal** la mayoría de los días: no hay ventanas
+surfeables. Cuando las haya, recibirás un mensaje por cada spot que las tenga.
 
 > 💡 **Para probar que Telegram funciona:** edita temporalmente el workflow y
 > baja los listones, p. ej. `WAVE_THRESHOLD: "0.1"`, `PERIOD_THRESHOLD: "0.1"`
@@ -174,36 +214,33 @@ haya, recibirás un mensaje por cada spot que las tenga.
 
 ## 📨 Cómo se ve la alerta
 
-Recibes **un mensaje por spot** con ventana. Ejemplo:
+Recibes **un mensaje por spot** con ventana, diseñado para leerse de un vistazo
+en el móvil. Ejemplo:
 
-> 🏄 **Ventana de surf detectada**
+> 🏄 **SURF · CASTELLDEFELS**
+> 2 ventanas en 2 dias
+> 🌡 Agua 19°C  ·  🧴 neopreno 3/2 mm
+> ━━━━━━━━━━━━━━━━━━━
 >
-> Spot: **Castelldefels**
-> Agua: 19C
-> Neopreno (sesión 2-3 h): agua ~19C: neopreno 3/2 mm
+> 📅 **JUE 04/06**
+> 🕐 16:00–20:00  (5 h)  ✅ coinciden EWAM y GWAM
+>      🌊 0.9–1.1 m  ·  ⏱ 5 s  ·  💨 15 km/h SSW  ·  🟢
 >
-> Criterio: olas >= 0.8 m, periodo >= 4.0 s, viento < 20 km/h, con luz, a partir de +3 h.
+> 📅 **VIE 05/06**
+> 🕐 07:00–13:00  (7 h)  · solo GWAM
+>      🌊 0.9–1.2 m  ·  ⏱ 5–6 s  ·  💨 14 km/h SW  ·  🟢
 >
-> **Modelo EWAM** — 1 ventana:
->   (4 h)
->   Franja: 15:00 - 18:00 del 16/05
->   Altura: 0.95 - 0.95 m
->   Periodo: 4.8 - 4.8 s
->   Dirección de la ola: viene del SSW
->   Calidad: mar limpio (predomina el swell de fondo)
->   Viento: 12 km/h del WNW
->
-> **Modelo GWAM** — 1 ventana:
->   (3 h)
->   Franja: 16:00 - 18:00 del 16/05
->   ...
->
-> 🔗 Ver previsión completa: https://www.windguru.cz/201
->
-> Fuente: Open-Meteo (modelos EWAM y GWAM, DWD)
+> ━━━━━━━━━━━━━━━━━━━
+> 🟢 limpio · 🟡 mixto · 🟠 movido
+> 🔗 Ver previsión completa
 
-Ver los dos modelos juntos te permite contrastar: si EWAM y GWAM coinciden,
-más confianza para ir; si discrepan, también es información útil.
+Claves de lectura:
+- **Agrupado por día**, porque lo natural es pensar "¿qué hago el jueves?".
+- **Los dos modelos fusionados:** cuando EWAM y GWAM coinciden en una ventana,
+  aparece "✅ coinciden EWAM y GWAM" (más confianza para ir). Si solo lo ve
+  uno, aparece "· solo EWAM/GWAM".
+- **Iconos como anclas:** 🌊 tamaño · ⏱ periodo · 💨 viento · semáforo de
+  calidad (🟢 limpio, 🟡 mixto, 🟠 movido).
 
 ---
 
@@ -214,18 +251,21 @@ lo que se abriga un punto más que para un baño corto):
 
 | Agua        | Recomendación |
 |-------------|---------------|
-| ≥ 24 °C     | Lycra o sin neopreno (a lo sumo top 1-2 mm) |
-| 22-23 °C    | Shorty 2 mm o neopreno corto |
+| ≥ 24 °C     | Lycra o sin neopreno |
+| 22-23 °C    | Shorty 2 mm |
 | 19-21 °C    | Neopreno 3/2 mm |
-| 16-18 °C    | Neopreno 4/3 mm (valora escarpines) |
-| 13-15 °C    | Neopreno 5/4 mm + escarpines; guantes y capucha si aguantas 2-3 h |
-| < 13 °C     | 5/4 mm o más, con capucha, guantes y escarpines |
+| 16-18 °C    | Neopreno 4/3 mm + escarpines |
+| 13-15 °C    | Neopreno 5/4 mm, escarpines y capucha |
+| < 13 °C     | 5/4 mm con capucha, guantes y escarpines |
+
+> El frío es personal: si eres friolero, sube un escalón; si aguantas bien,
+> baja uno. Los rangos están en la función `wetsuit_recommendation` del código.
 
 ---
 
 ## ⚙️ Configuración
 
-Toda la configuración de umbrales vive en el bloque `env:` del archivo
+Los umbrales viven en el bloque `env:` del archivo
 `.github/workflows/surf-monitor.yml`. Los spots, en la lista `SPOTS` de
 `surf_monitor.py`.
 
@@ -259,35 +299,37 @@ nombre que verás con el identificador de Open-Meteo. Otros válidos:
 
 Para **cada spot** de la lista:
 
-1. **Una llamada a la Forecast API** para datos auxiliares: viento horario y
-   orto/ocaso diarios.
-2. **Una llamada a la Marine API por cada modelo** (EWAM, GWAM), pidiendo
-   altura, periodo, dirección, swell, wind wave y **temperatura del agua**,
-   con `cell_selection=sea` para forzar una celda de mar.
-3. **Cruce de datos.** Cada franja horaria se empareja con su viento y se marca
-   como diurna o nocturna, formando objetos `SurfSlot`.
-4. **Filtrado temporal.** Se conservan solo las franjas a partir de ahora +
+1. **Una llamada a la Forecast API** para viento horario y orto/ocaso diarios.
+2. **Una llamada a la Marine API sin forzar modelo** para la temperatura del
+   agua (la provee MeteoFrance).
+3. **Una llamada a la Marine API por cada modelo** de oleaje (EWAM, GWAM),
+   pidiendo altura, periodo, dirección, swell y wind wave, con
+   `cell_selection=sea` para forzar una celda de mar.
+4. **Cruce de datos.** Cada franja horaria de oleaje se empareja con su viento,
+   su temperatura del agua y se marca como diurna o nocturna, formando objetos
+   `SurfSlot`.
+5. **Filtrado temporal.** Se conservan solo las franjas a partir de ahora +
    `LEAD_TIME_HOURS`, hacia delante hasta el final de los datos (~4 días).
-5. **Evaluación.** Cada franja se marca como surfeable o no según las 5
+6. **Evaluación.** Cada franja se marca como surfeable o no según las 5
    condiciones. Se buscan **todas** las rachas de `CONSECUTIVE_SLOTS` franjas
    consecutivas (la noche resetea el contador).
-6. **Notificación.** Si el spot tiene al menos una racha en algún modelo, se
-   envía un único mensaje con todos los modelos combinados, la temperatura del
-   agua, la recomendación de neopreno y el enlace a la previsión visual.
+7. **Fusión y notificación.** Las rachas de ambos modelos que se solapan en el
+   tiempo se fusionan (marcando si coinciden), se agrupan por día, y se envía
+   un único mensaje por spot con la temperatura, el neopreno y el enlace.
 
-**Tolerancia a fallos:** si la Forecast API auxiliar falla, el spot sigue
-evaluándose (no penaliza por falta de viento ni de sol). Si un modelo de oleaje
-falla, el otro se evalúa igual. Si un spot entero falla, los demás se evalúan
-con normalidad.
+**Tolerancia a fallos:** si la Forecast API o la llamada de temperatura fallan,
+el spot sigue evaluándose (no penaliza por falta de viento, luz o temperatura).
+Si un modelo de oleaje falla, el otro se evalúa igual. Si un spot entero falla,
+los demás se evalúan con normalidad.
 
 ---
 
 ## 💸 Coste
 
 Cero. GitHub Actions es gratuito dentro de cuota (este workflow consume pocos
-minutos por ejecución, 4 veces al día, aunque ahora hace más llamadas al
-evaluar tres spots). Open-Meteo es gratuito para uso no comercial sin clave ni
-registro. No hay servidor que mantener.
+minutos por ejecución, 4 veces al día; ahora hace más llamadas al evaluar tres
+spots con varias fuentes, pero sigue siendo muy poco). Open-Meteo es gratuito
+para uso no comercial sin clave ni registro. No hay servidor que mantener.
 
 ---
 
@@ -295,17 +337,20 @@ registro. No hay servidor que mantener.
 
 | Síntoma | Causa probable | Solución |
 |---|---|---|
+| Error al guardar el workflow: `'jobs' is already defined` | El contenido del YAML quedó pegado dos veces | Vacía el archivo entero y pega una sola vez. |
 | `Open-Meteo rechazo la peticion: ...` | Un parámetro mal formado o id de modelo inválido | El log muestra el motivo exacto que da la API. |
-| Un modelo dice "Sin datos" para un spot | Ese modelo no cubre esas coordenadas | EWAM solo cubre Europa; GWAM es global. Ajusta las coordenadas del spot un poco más mar adentro. |
+| `[spot/sst] Temperatura del agua: 0 franjas con dato` | MeteoFrance no cubre ese punto exacto | Ajusta las coordenadas del spot un poco más mar adentro. |
+| Agua "sin dato" en la alerta | La llamada de temperatura falló o devolvió vacío | Revisa la línea `[spot/sst]` del log; suele resolverse solo o ajustando coordenadas. |
+| Un modelo dice "Sin datos" para un spot | Ese modelo no cubre esas coordenadas | EWAM solo cubre Europa; GWAM es global. Ajusta coordenadas mar adentro. |
 | `[spot/aux] No se pudieron obtener datos auxiliares` | La Forecast API falló | No es crítico: el spot sigue, pero sin filtrar por viento ni luz esa vez. |
 | No llega ningún mensaje | Token/chat_id mal, o no hay ventanas | Revisa Secrets y prueba el truco de bajar umbrales. "0 mensajes" suele ser normal. |
-| Agua "sin dato" en la alerta | El modelo no devolvió temperatura para ese punto | Suele resolverse solo en la siguiente ejecución; si persiste, ajusta las coordenadas del spot. |
 | El schedule no arranca solo | GitHub tarda en activar el primer schedule, o pausa workflows en repos inactivos ~60 días | Usa **Run workflow** y haz algún commit de vez en cuando. |
 
 ---
 
 ## 📜 Licencia
 
-Código bajo licencia MIT. Datos de oleaje, viento, temperatura del agua y
-orto/ocaso por **Open-Meteo** (CC BY 4.0), generados a partir de los modelos
-del Deutscher Wetterdienst (DWD).
+Código bajo licencia MIT. Datos de oleaje, viento y orto/ocaso por
+**Open-Meteo** (CC BY 4.0), generados a partir de los modelos del Deutscher
+Wetterdienst (DWD); temperatura del agua de **MeteoFrance** vía Copernicus
+Marine.
