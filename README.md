@@ -32,11 +32,12 @@ sentido avisarte de una ventana que empieza en 30 minutos si no te da tiempo a
 coger el coche y llegar.
 
 Si hay **3 horas consecutivas** que cumplen las cinco condiciones, el spot
-tiene una ventana, y recibes un mensaje que incluye:
-- Las ventanas detectadas, **agrupadas por día** y con los dos modelos
-  (EWAM y GWAM) fusionados (cuando coinciden, es señal de confianza).
-- La **temperatura del agua** y una **recomendación de neopreno** para una
-  sesión de 2-3 h.
+tiene una ventana, y recibes un mensaje minimalista que incluye:
+- Las ventanas detectadas, con el **día en negrita** y los dos modelos
+  (EWAM y GWAM) fusionados cuando coinciden.
+- Altura, periodo, **dirección del mar de fondo**, viento y temperatura exterior.
+- La **temperatura del agua** y una **recomendación de neopreno** ajustada por
+  agua, aire y viento para una sesión de 2-3 h.
 - Un **enlace a la previsión visual** del spot en Windguru.
 
 > **Nota sobre estos spots.** Son spots mediterráneos de **swell débil**: el
@@ -87,9 +88,10 @@ las tiene todas:
 
 | Dato                        | Fuente / endpoint                              |
 |-----------------------------|------------------------------------------------|
-| Oleaje (altura, periodo, swell, viento-ola) | Marine API, modelos DWD **EWAM** y **GWAM** |
+| Oleaje (altura, periodo, swell, dirección del swell, viento-ola) | Marine API, modelos DWD **EWAM** y **GWAM** |
 | **Temperatura del agua**    | Marine API, sin forzar modelo (la provee **MeteoFrance**) |
 | Viento (velocidad/dirección)| Forecast API |
+| **Temperatura exterior**    | Forecast API (`temperature_2m`) |
 | Orto y ocaso                | Forecast API (`sunrise`, `sunset`) |
 
 > ℹ️ Detalle técnico importante: la temperatura del agua **no** la traen los
@@ -192,7 +194,7 @@ para confirmar que todo va bien:
 ```
 --- Evaluando spot: Castelldefels ---
 [Castelldefels/aux] Consultando Forecast API (viento + sol)...
-[Castelldefels/aux] Viento: 96 franjas. Luz solar: 4 dias.
+[Castelldefels/aux] Viento: 96 franjas. Temperatura exterior: 96 franjas. Luz solar: 4 dias.
 [Castelldefels/sst] Consultando temperatura del agua...
 [Castelldefels/sst] Temperatura del agua: 96 franjas con dato.   <-- debe ser > 0
 [Castelldefels/EWAM] Obtenidas 96 franjas con datos completos.
@@ -215,42 +217,78 @@ surfeables. Cuando las haya, recibirás un mensaje por cada spot que las tenga.
 ## 📨 Cómo se ve la alerta
 
 Recibes **un mensaje por spot** con ventana, diseñado para leerse de un vistazo
-en el móvil. Ejemplo:
+en el móvil. El estilo es deliberadamente minimalista: pocos iconos, sin
+separadores visuales y con la información ordenada para decidir rápido si ir o
+no ir.
 
-> 🏄 **SURF · CASTELLDEFELS**
-> 2 ventanas en 2 dias
-> 🌡 Agua 19°C  ·  🧴 neopreno 3/2 mm
-> ━━━━━━━━━━━━━━━━━━━
->
-> 📅 **JUE 04/06**
-> 🕐 16:00–20:00  (5 h)  ✅ coinciden EWAM y GWAM
->      🌊 0.9–1.1 m  ·  ⏱ 5 s  ·  💨 15 km/h SSW  ·  🟢
->
-> 📅 **VIE 05/06**
-> 🕐 07:00–13:00  (7 h)  · solo GWAM
->      🌊 0.9–1.2 m  ·  ⏱ 5–6 s  ·  💨 14 km/h SW  ·  🟢
->
-> ━━━━━━━━━━━━━━━━━━━
-> 🟢 limpio · 🟡 mixto · 🟠 movido
-> 🔗 Ver previsión completa
+Ejemplo con **una sola ventana**:
+
+```text
+Castelldefels · Buena ventana
+
+*Jue 04/06*, de 16:00 a 20:00
+
+Olas: 0.9–1.1 m
+Periodo: 5 s
+Dirección mar de fondo: ESE
+Viento: 15 km/h SSW
+Temperatura exterior: 18 °C
+Mar: limpio
+Confianza: EWAM + GWAM
+
+Agua 19 °C · aire 18 °C · neopreno 3/2 mm
+
+https://www.windguru.cz/201
+```
+
+Ejemplo con **varias ventanas**:
+
+```text
+Castelldefels · 2 ventanas
+
+*Jue 04/06*
+16:00–20:00
+0.9–1.1 m · 5 s · mar de fondo ESE · 15 km/h SSW
+Aire 18 °C · neopreno 3/2 mm
+Limpio · EWAM + GWAM
+
+*Vie 05/06*
+07:00–13:00
+0.9–1.2 m · 5–6 s · mar de fondo SE · 14 km/h SW
+Aire 14 °C · neopreno 4/3 mm + escarpines
+Limpio · solo GWAM
+
+Agua 19 °C
+
+https://www.windguru.cz/201
+```
 
 Claves de lectura:
-- **Agrupado por día**, porque lo natural es pensar "¿qué hago el jueves?".
-- **Los dos modelos fusionados:** cuando EWAM y GWAM coinciden en una ventana,
-  aparece "✅ coinciden EWAM y GWAM" (más confianza para ir). Si solo lo ve
-  uno, aparece "· solo EWAM/GWAM".
-- **Iconos como anclas:** 🌊 tamaño · ⏱ periodo · 💨 viento · semáforo de
-  calidad (🟢 limpio, 🟡 mixto, 🟠 movido).
+- **Día en negrita:** pensado para escanear rápido las ventanas por fecha.
+- **Dirección del mar de fondo:** indica de dónde viene el swell, separada de
+  la dirección del viento.
+- **Confianza:** si coinciden EWAM y GWAM, la ventana tiene más respaldo; si
+  solo aparece un modelo, se muestra como `solo EWAM` o `solo GWAM`.
+- **Neopreno por ventana:** se ajusta con temperatura del agua, temperatura
+  exterior y viento medio de esa ventana.
 
 ---
 
 ## 🧴 Recomendación de neopreno
 
-Según la temperatura del agua, para una sesión de 2-3 h (exposición larga, por
-lo que se abriga un punto más que para un baño corto):
+La recomendación de neopreno está pensada para una sesión de **2-3 horas**.
+Antes se basaba solo en la temperatura del agua; ahora combina tres factores:
 
-| Agua        | Recomendación |
-|-------------|---------------|
+1. **Temperatura del agua** — define la base de la recomendación.
+2. **Temperatura exterior** — ajusta el nivel de abrigo si hace frío o calor
+   fuera del agua.
+3. **Viento medio de la ventana** — sube el nivel de abrigo cuando el viento
+   aumenta la sensación de frío.
+
+### Base por temperatura del agua
+
+| Agua        | Base de recomendación |
+|-------------|------------------------|
 | ≥ 24 °C     | Lycra o sin neopreno |
 | 22-23 °C    | Shorty 2 mm |
 | 19-21 °C    | Neopreno 3/2 mm |
@@ -258,8 +296,24 @@ lo que se abriga un punto más que para un baño corto):
 | 13-15 °C    | Neopreno 5/4 mm, escarpines y capucha |
 | < 13 °C     | 5/4 mm con capucha, guantes y escarpines |
 
+### Ajustes por aire y viento
+
+| Condición | Ajuste aplicado |
+|-----------|-----------------|
+| Aire ≤ 8 °C | Sube 2 niveles de abrigo |
+| Aire 9-12 °C | Sube 1 nivel de abrigo |
+| Aire ≥ 23 °C | Baja 1 nivel si el agua lo permite |
+| Viento ≥ 32 km/h | Sube 2 niveles de abrigo |
+| Viento 25-31 km/h | Sube 1 nivel de abrigo |
+| Viento ≤ 8 km/h | Baja 1 nivel si el agua lo permite |
+| Aire ≤ 15 °C y viento ≥ 18 km/h | Sube 1 nivel adicional |
+
+La lógica es conservadora: el agua sigue mandando. Aunque haga calor fuera, el
+sistema evita recomendar algo demasiado ligero si el agua está fresca o fría.
+Los rangos están definidos en la función `wetsuit_recommendation` del código.
+
 > El frío es personal: si eres friolero, sube un escalón; si aguantas bien,
-> baja uno. Los rangos están en la función `wetsuit_recommendation` del código.
+> baja uno.
 
 ---
 
@@ -299,15 +353,16 @@ nombre que verás con el identificador de Open-Meteo. Otros válidos:
 
 Para **cada spot** de la lista:
 
-1. **Una llamada a la Forecast API** para viento horario y orto/ocaso diarios.
+1. **Una llamada a la Forecast API** para viento horario, temperatura exterior
+   y orto/ocaso diarios.
 2. **Una llamada a la Marine API sin forzar modelo** para la temperatura del
    agua (la provee MeteoFrance).
 3. **Una llamada a la Marine API por cada modelo** de oleaje (EWAM, GWAM),
-   pidiendo altura, periodo, dirección, swell y wind wave, con
-   `cell_selection=sea` para forzar una celda de mar.
+   pidiendo altura, periodo, dirección de ola, swell, **dirección del swell** y
+   wind wave, con `cell_selection=sea` para forzar una celda de mar.
 4. **Cruce de datos.** Cada franja horaria de oleaje se empareja con su viento,
-   su temperatura del agua y se marca como diurna o nocturna, formando objetos
-   `SurfSlot`.
+   temperatura exterior, temperatura del agua y se marca como diurna o nocturna,
+   formando objetos `SurfSlot`.
 5. **Filtrado temporal.** Se conservan solo las franjas a partir de ahora +
    `LEAD_TIME_HOURS`, hacia delante hasta el final de los datos (~4 días).
 6. **Evaluación.** Cada franja se marca como surfeable o no según las 5
@@ -315,10 +370,12 @@ Para **cada spot** de la lista:
    consecutivas (la noche resetea el contador).
 7. **Fusión y notificación.** Las rachas de ambos modelos que se solapan en el
    tiempo se fusionan (marcando si coinciden), se agrupan por día, y se envía
-   un único mensaje por spot con la temperatura, el neopreno y el enlace.
+   un único mensaje por spot con dirección del mar de fondo, temperatura
+   exterior, temperatura del agua, neopreno recomendado y enlace a Windguru.
 
 **Tolerancia a fallos:** si la Forecast API o la llamada de temperatura fallan,
-el spot sigue evaluándose (no penaliza por falta de viento, luz o temperatura).
+el spot sigue evaluándose (no penaliza por falta de viento, luz, temperatura
+exterior o temperatura del agua).
 Si un modelo de oleaje falla, el otro se evalúa igual. Si un spot entero falla,
 los demás se evalúan con normalidad.
 
@@ -340,7 +397,9 @@ para uso no comercial sin clave ni registro. No hay servidor que mantener.
 | Error al guardar el workflow: `'jobs' is already defined` | El contenido del YAML quedó pegado dos veces | Vacía el archivo entero y pega una sola vez. |
 | `Open-Meteo rechazo la peticion: ...` | Un parámetro mal formado o id de modelo inválido | El log muestra el motivo exacto que da la API. |
 | `[spot/sst] Temperatura del agua: 0 franjas con dato` | MeteoFrance no cubre ese punto exacto | Ajusta las coordenadas del spot un poco más mar adentro. |
-| Agua "sin dato" en la alerta | La llamada de temperatura falló o devolvió vacío | Revisa la línea `[spot/sst]` del log; suele resolverse solo o ajustando coordenadas. |
+| Agua "sin dato" en la alerta | La llamada de temperatura del agua falló o devolvió vacío | Revisa la línea `[spot/sst]` del log; suele resolverse solo o ajustando coordenadas. |
+| Aire "s/d" en la alerta | La Forecast API no devolvió `temperature_2m` | No es crítico; la recomendación de neopreno se calculará con agua y viento si están disponibles. |
+| Dirección mar de fondo "s/d" | El modelo no devolvió `swell_wave_direction` | No es crítico; revisa la previsión visual en Windguru si quieres confirmar la dirección. |
 | Un modelo dice "Sin datos" para un spot | Ese modelo no cubre esas coordenadas | EWAM solo cubre Europa; GWAM es global. Ajusta coordenadas mar adentro. |
 | `[spot/aux] No se pudieron obtener datos auxiliares` | La Forecast API falló | No es crítico: el spot sigue, pero sin filtrar por viento ni luz esa vez. |
 | No llega ningún mensaje | Token/chat_id mal, o no hay ventanas | Revisa Secrets y prueba el truco de bajar umbrales. "0 mensajes" suele ser normal. |
