@@ -84,6 +84,10 @@ class Spot:
     latitude: float
     longitude: float
     forecast_url: str
+    # Orientacion de la playa: rumbo (grados) HACIA donde mira el mar abierto.
+    # Sirve para clasificar el viento como offshore/onshore. Estimado por la
+    # geografia de cada costa.
+    facing_deg: float
 
 
 SPOTS: list[Spot] = [
@@ -92,18 +96,21 @@ SPOTS: list[Spot] = [
         latitude=41.25,
         longitude=2.00,
         forecast_url="https://www.windguru.cz/201",
+        facing_deg=155,   # mira al SSE
     ),
     Spot(
         name="Masnou",
         latitude=41.474775,
         longitude=2.305556,
         forecast_url="https://www.windguru.cz/501030",
+        facing_deg=150,   # mira al SSE (costa del Maresme)
     ),
     Spot(
         name="Sitges",
         latitude=41.234065,
         longitude=1.820438,
         forecast_url="https://www.windguru.cz/48885",
+        facing_deg=190,   # mira al S/SSW (la costa gira al sur)
     ),
 ]
 
@@ -161,7 +168,7 @@ FORECAST_API_URL: str = "https://api.open-meteo.com/v1/forecast"
 # GWAM (solo dan oleaje). La pedimos aparte, sin forzar modelo, mas abajo.
 MARINE_HOURLY_VARS: str = (
     "wave_height,wave_period,wave_direction,"
-    "swell_wave_height,swell_wave_period,"
+    "swell_wave_height,swell_wave_period,swell_wave_direction,"
     "wind_wave_height"
 )
 # Variable de temperatura del agua. Se pide SIN forzar modelo, para que
@@ -218,6 +225,7 @@ class SurfSlot:
     wave_direction: float | None        # Direccion de donde viene la ola (grados)
     swell_height: float | None          # Altura del oleaje de fondo / swell (m)
     swell_period: float | None          # Periodo del swell (s)
+    swell_direction: float | None       # Direccion de donde viene el swell (grados)
     wind_wave_height: float | None      # Altura del oleaje de viento local (m)
     water_temp: float | None = None     # Temperatura del agua (C)
     wind_speed: float | None = None     # Velocidad del viento a 10 m (km/h)
@@ -301,25 +309,25 @@ class SpotResult:
 
 def wetsuit_recommendation(water_temp: float | None) -> str:
     """
-    Devuelve una recomendacion de neopreno (solo la prenda, sin repetir la
-    temperatura) segun la temperatura del agua, pensada para una sesion larga
-    de 2-3 h. Si no hay dato, devuelve cadena vacia (el llamador lo gestiona).
+    Devuelve una recomendacion de neopreno en INGLES (solo la prenda, sin
+    repetir la temperatura), pensada para una sesion larga de 2-3 h. Si no hay
+    dato, devuelve cadena vacia (el llamador lo gestiona).
     """
     if water_temp is None:
         return ""
 
     t = water_temp
     if t >= 24:
-        return "lycra o sin neopreno"
+        return "rashguard or no wetsuit"
     if t >= 22:
-        return "shorty 2 mm"
+        return "2 mm shorty"
     if t >= 19:
-        return "neopreno 3/2 mm"
+        return "3/2 mm wetsuit"
     if t >= 16:
-        return "neopreno 4/3 mm + escarpines"
+        return "4/3 mm + boots"
     if t >= 13:
-        return "neopreno 5/4 mm, escarpines y capucha"
-    return "5/4 mm con capucha, guantes y escarpines"
+        return "5/4 mm, boots & hood"
+    return "5/4 mm with hood, gloves & boots"
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +486,7 @@ def fetch_model_forecast(spot: Spot, model_label: str, model_id: str, aux: Auxil
     h_wavedir = hourly.get("wave_direction", [])
     h_swell_h = hourly.get("swell_wave_height", [])
     h_swell_p = hourly.get("swell_wave_period", [])
+    h_swell_d = hourly.get("swell_wave_direction", [])
     h_wind_w = hourly.get("wind_wave_height", [])
     # La temperatura del agua NO se lee aqui: viene del mapa de aux (SST se
     # pide aparte, sin forzar modelo, porque EWAM/GWAM no la traen).
@@ -518,6 +527,7 @@ def fetch_model_forecast(spot: Spot, model_label: str, model_id: str, aux: Auxil
             wave_direction=_safe_get(h_wavedir, i),
             swell_height=_safe_get(h_swell_h, i),
             swell_period=_safe_get(h_swell_p, i),
+            swell_direction=_safe_get(h_swell_d, i),
             wind_wave_height=_safe_get(h_wind_w, i),
             water_temp=water_temp,
             wind_speed=wind_speed,
@@ -621,8 +631,117 @@ def _degrees_to_compass(deg: float | None) -> str:
     return dirs[idx]
 
 
-# Dias de la semana en castellano abreviados (datetime.weekday(): 0 = lunes).
-_WEEKDAYS_ES = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"]
+def _wind_arrow(wind_from_deg: float | None) -> str:
+    """
+    Flecha que apunta HACIA donde sopla el viento (no de donde viene).
+    Si el viento viene del norte (0), sopla hacia el sur, flecha hacia abajo.
+    Usa 8 direcciones.
+    """
+    if wind_from_deg is None:
+        return ""
+    wind_to = (wind_from_deg + 180) % 360
+    arrows = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
+    idx = int((wind_to + 22.5) % 360 / 45)
+    return arrows[idx]
+
+
+def classify_wind(beach_facing_deg: float, wind_from_deg: float | None) -> str:
+    """
+    Clasifica el viento respecto a la orientacion de la playa:
+      - offshore : sopla de tierra a mar (peina la ola, ideal).
+      - cross-off: lateral con componente de tierra (aceptable).
+      - cross-on : lateral con componente de mar (regular).
+      - onshore  : sopla de mar a tierra (deshace la ola, malo).
+    Devuelve "" si no hay dato de viento.
+
+    Metodo: comparamos HACIA donde sopla el viento con HACIA donde mira la
+    playa (su mar abierto). Si coinciden -> offshore; si son opuestos -> onshore.
+    """
+    if wind_from_deg is None:
+        return ""
+    wind_to = (wind_from_deg + 180) % 360
+    diff = abs((wind_to - beach_facing_deg + 180) % 360 - 180)
+    if diff <= 45:
+        return "offshore"
+    if diff <= 90:
+        return "cross-off"
+    if diff <= 135:
+        return "cross-on"
+    return "onshore"
+
+
+def compute_stars(
+    height_max: float,
+    swell_period: float | None,
+    wind_kmh: float | None,
+    wind_class: str,
+    models_agree: bool,
+) -> int:
+    """
+    Calcula la calidad de una ventana en estrellas (1-5), calibrado para el
+    Mediterraneo (swell debil): 5 estrellas no es un dia de oceano, es un dia
+    notable PARA ESTA COSTA.
+
+    Suma puntos de 4 factores (maximo teorico 5.5):
+      - Tamano (0-2): lo primero, sin tamano no hay sesion.
+      - Periodo del swell (0-1.5): la energia/calidad de la ola.
+      - Viento (0-1.5): OPCION DURA, onshore penaliza a 0.
+      - Coincidencia de modelos (0-0.5): fiabilidad de la prevision.
+
+    5 estrellas es RARO Y ESPECIAL: exige >=5.0 puntos Y tamano real (>=1.0m).
+    Un dia pequeno, por perfecto que este, tope en 4 estrellas.
+    """
+    pts = 0.0
+
+    # Tamano (0-2).
+    if height_max >= 1.2:
+        pts += 2.0
+    elif height_max >= 1.0:
+        pts += 1.5
+    elif height_max >= 0.8:
+        pts += 1.0
+    else:
+        pts += 0.5
+
+    # Periodo del swell (0-1.5).
+    sp = swell_period if swell_period is not None else 0.0
+    if sp >= 6:
+        pts += 1.5
+    elif sp >= 5:
+        pts += 1.0
+    elif sp >= 4:
+        pts += 0.5
+
+    # Viento (0-1.5). Opcion dura: onshore = 0.
+    clase_pts = {"offshore": 1.0, "cross-off": 0.6, "cross-on": 0.3, "onshore": 0.0}
+    p = clase_pts.get(wind_class, 0.3)
+    if wind_kmh is not None and wind_kmh < 12:
+        p += 0.5
+    pts += min(p, 1.5)
+
+    # Coincidencia de modelos (0-0.5).
+    if models_agree:
+        pts += 0.5
+
+    # Mapeo. 5 estrellas raro: umbral alto Y tamano real.
+    if pts >= 5.0 and height_max >= 1.0:
+        return 5
+    if pts >= 3.5:
+        return 4
+    if pts >= 2.5:
+        return 3
+    if pts >= 1.5:
+        return 2
+    return 1
+
+
+def _stars_str(n: int) -> str:
+    """Cadena visual de estrellas: llenas + vacias hasta 5."""
+    return "★" * n + "☆" * (5 - n)
+
+
+# Dias de la semana en ingles abreviados (datetime.weekday(): 0 = lunes).
+_WEEKDAYS_EN = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 @dataclass
@@ -641,15 +760,19 @@ class _Window:
     wind_kmh: float | None
     wind_dir: float | None
     wave_dir: float | None
-    quality: str            # "limpio" / "picado" / "mixto"
-    models: set[str]        # modelos que la respaldan
+    swell_dir: float | None       # direccion de donde viene el swell de fondo
+    swell_period: float | None    # periodo propio del swell de fondo
+    quality: str                  # "limpio" / "picado" / "mixto"
+    models: set[str]              # modelos que la respaldan
+    facing_deg: float             # orientacion de la playa (para offshore/onshore)
 
 
-def _streak_to_window(streak: list[SurfSlot], model: str) -> _Window:
+def _streak_to_window(streak: list[SurfSlot], model: str, facing_deg: float) -> _Window:
     """Convierte una racha cruda en una _Window resumida."""
     heights = [s.wave_height for s in streak]
     periods = [s.wave_period for s in streak]
     winds = [s.wind_speed for s in streak if s.wind_speed is not None]
+    swell_periods = [s.swell_period for s in streak if s.swell_period is not None]
     labels = [s.quality_label() for s in streak]
 
     if labels.count("limpio") >= labels.count("picado"):
@@ -668,8 +791,11 @@ def _streak_to_window(streak: list[SurfSlot], model: str) -> _Window:
         wind_kmh=(sum(winds) / len(winds)) if winds else None,
         wind_dir=streak[mid].wind_direction,
         wave_dir=streak[mid].wave_direction,
+        swell_dir=streak[mid].swell_direction,
+        swell_period=(sum(swell_periods) / len(swell_periods)) if swell_periods else None,
         quality=quality,
         models={model},
+        facing_deg=facing_deg,
     )
 
 
@@ -680,6 +806,7 @@ def _overlaps(a: _Window, b: _Window) -> bool:
 
 def _merge_windows(a: _Window, b: _Window) -> _Window:
     """Fusiona dos ventanas solapadas, uniendo rangos y modelos."""
+    a_larga = (a.end - a.start) >= (b.end - b.start)
     return _Window(
         start=min(a.start, b.start),
         end=max(a.end, b.end),
@@ -687,15 +814,18 @@ def _merge_windows(a: _Window, b: _Window) -> _Window:
         h_max=max(a.h_max, b.h_max),
         p_min=min(a.p_min, b.p_min),
         p_max=max(a.p_max, b.p_max),
-        # Viento y direccion: nos quedamos con los de la ventana mas larga.
-        wind_kmh=a.wind_kmh if (a.end - a.start) >= (b.end - b.start) else b.wind_kmh,
-        wind_dir=a.wind_dir if (a.end - a.start) >= (b.end - b.start) else b.wind_dir,
-        wave_dir=a.wave_dir if (a.end - a.start) >= (b.end - b.start) else b.wave_dir,
+        # Viento y direcciones: nos quedamos con los de la ventana mas larga.
+        wind_kmh=a.wind_kmh if a_larga else b.wind_kmh,
+        wind_dir=a.wind_dir if a_larga else b.wind_dir,
+        wave_dir=a.wave_dir if a_larga else b.wave_dir,
+        swell_dir=a.swell_dir if a_larga else b.swell_dir,
+        swell_period=a.swell_period if a_larga else b.swell_period,
         # Calidad: si alguna es "picado", lo reflejamos (mas conservador).
         quality="picado" if "picado" in (a.quality, b.quality) else (
             "limpio" if "limpio" in (a.quality, b.quality) else "mixto"
         ),
         models=a.models | b.models,
+        facing_deg=a.facing_deg,
     )
 
 
@@ -705,10 +835,11 @@ def _collect_and_merge_windows(result: SpotResult) -> list[_Window]:
     _Window, y fusiona las que se solapan en el tiempo (aunque vengan de
     modelos distintos). Devuelve la lista final ordenada cronologicamente.
     """
+    facing = result.spot.facing_deg
     raw: list[_Window] = []
     for model_label, streaks in result.streaks_by_model.items():
         for streak in streaks:
-            raw.append(_streak_to_window(streak, model_label))
+            raw.append(_streak_to_window(streak, model_label, facing))
 
     # Fusion iterativa: mientras encontremos solapamientos, fusionamos.
     raw.sort(key=lambda w: w.start)
@@ -727,131 +858,187 @@ def _collect_and_merge_windows(result: SpotResult) -> list[_Window]:
     return merged
 
 
-def _format_height_range(w: _Window) -> str:
-    """Formato minimalista para el rango de altura."""
+def _fmt_height(w: _Window) -> str:
+    """Rango de altura de ola."""
     if w.h_max - w.h_min < 0.1:
         return f"{w.h_max:.1f} m"
     return f"{w.h_min:.1f}–{w.h_max:.1f} m"
 
 
-def _format_period_range(w: _Window) -> str:
-    """Formato minimalista para el rango de periodo."""
+def _fmt_period(w: _Window) -> str:
+    """Rango de periodo de la ola total."""
     if round(w.p_min) == round(w.p_max):
         return f"{w.p_max:.0f} s"
     return f"{w.p_min:.0f}–{w.p_max:.0f} s"
 
 
-def _format_wind(w: _Window) -> str:
-    """Formato minimalista para viento."""
+def _fmt_swell(w: _Window) -> str:
+    """Direccion y periodo del swell de fondo (ej. 'SW · 5.3 s')."""
+    parts = []
+    if w.swell_dir is not None:
+        parts.append(_degrees_to_compass(w.swell_dir))
+    if w.swell_period is not None:
+        parts.append(f"{w.swell_period:.1f} s")
+    if not parts:
+        return "n/a"
+    return " · ".join(parts)
+
+
+def _fmt_wind(w: _Window) -> str:
+    """Viento: velocidad, direccion, flecha y clase (offshore/onshore...)."""
     if w.wind_kmh is None:
-        return "s/d"
-    return f"{w.wind_kmh:.0f} km/h {_degrees_to_compass(w.wind_dir)}"
+        return "n/a"
+    compass = _degrees_to_compass(w.wind_dir)
+    arrow = _wind_arrow(w.wind_dir)
+    wind_class = classify_wind(w.facing_deg, w.wind_dir)
+    base = f"{w.wind_kmh:.0f} km/h {compass}"
+    if arrow:
+        base += f" {arrow}"
+    if wind_class:
+        base += f" {wind_class}"
+    return base
 
 
-def _format_confidence(w: _Window) -> str:
-    """Texto de confianza segun los modelos que respaldan la ventana."""
+def _fmt_sea(w: _Window) -> str:
+    """Estado del mar en ingles."""
+    return {"limpio": "clean", "picado": "choppy", "mixto": "mixed"}.get(w.quality, w.quality)
+
+
+def _fmt_models(w: _Window) -> str:
+    """Modelos que respaldan la ventana."""
     if len(w.models) >= 2:
         return "EWAM + GWAM"
-    return f"solo {next(iter(w.models))}"
+    return f"{next(iter(w.models))} only"
 
 
-def _format_day_label(dt: datetime) -> str:
-    """Etiqueta de dia pensada para lectura rapida en Telegram."""
+def _window_stars(w: _Window) -> int:
+    """Estrellas de calidad de una ventana, usando su mejor altura."""
+    wind_class = classify_wind(w.facing_deg, w.wind_dir)
+    models_agree = len(w.models) >= 2
+    return compute_stars(w.h_max, w.swell_period, w.wind_kmh, wind_class, models_agree)
+
+
+def _verdict(stars: int) -> str:
+    """Veredicto-titular en ingles segun las estrellas."""
+    return {
+        5: "Epic window",
+        4: "Great window",
+        3: "Good window",
+        2: "Rideable",
+        1: "Marginal",
+    }.get(stars, "Window")
+
+
+def _day_label_en(dt: datetime) -> str:
+    """Etiqueta de dia en ingles (Today / Tomorrow / Wed 04/06)."""
     try:
         today = datetime.now(ZoneInfo(TIMEZONE)).date()
     except Exception:
         today = datetime.now().date()
-
     if dt.date() == today:
-        return "Hoy"
+        return "Today"
     if dt.date() == today + timedelta(days=1):
-        return "Mañana"
-
-    weekday = _WEEKDAYS_ES[dt.weekday()].capitalize()
-    return f"{weekday} {dt:%d/%m}"
+        return "Tomorrow"
+    return f"{_WEEKDAYS_EN[dt.weekday()]} {dt:%d/%m}"
 
 
-def _format_water_line(temp: float | None) -> str:
-    """Linea final con temperatura y neopreno, sin iconos."""
+def _fmt_water(temp: float | None) -> str:
+    """Linea de agua + neopreno en ingles."""
     if temp is None:
-        return "Agua: sin dato · lleva el de siempre"
-    return f"Agua {temp:.0f} °C · {wetsuit_recommendation(temp)}"
+        return "Water n/a · bring your usual suit"
+    suit = wetsuit_recommendation(temp)
+    return f"Water {temp:.0f}° · {suit}" if suit else f"Water {temp:.0f}°"
 
 
-def _format_single_window_message(spot: Spot, w: _Window, temp: float | None) -> str:
-    """Mensaje minimalista para un spot con una unica ventana."""
-    day_label = _format_day_label(w.start)
-    day_prefix = "Hoy" if day_label == "Hoy" else day_label
-
-    return "\n".join([
-        f"{spot.name} · Buena ventana",
-        "",
-        f"{day_prefix} de {w.start:%H:%M} a {w.end:%H:%M}",
-        "",
-        f"Olas: {_format_height_range(w)}",
-        f"Periodo: {_format_period_range(w)}",
-        f"Viento: {_format_wind(w)}",
-        f"Mar: {w.quality}",
-        f"Confianza: {_format_confidence(w)}",
-        "",
-        _format_water_line(temp),
-        "",
-        spot.forecast_url,
-    ])
+def _aligned(label: str, value: str, width: int = 8) -> str:
+    """Fila etiqueta-valor alineada en columnas (estilo Apple)."""
+    return f"{label:<{width}}{value}"
 
 
-def _format_multi_window_block(w: _Window, include_day: bool = True) -> list[str]:
-    """Bloque compacto para una ventana cuando hay varias."""
-    lines: list[str] = []
-    if include_day:
-        lines.append(_format_day_label(w.start))
-    lines.extend([
-        f"{w.start:%H:%M}–{w.end:%H:%M}",
-        (
-            f"{_format_height_range(w)} · "
-            f"{_format_period_range(w)} · "
-            f"{_format_wind(w)}"
-        ),
-        f"{w.quality.capitalize()} · {_format_confidence(w)}",
-    ])
-    return lines
+def _window_detail_block(w: _Window) -> list[str]:
+    """
+    Bloque de detalle de UNA ventana en formato columnas alineadas.
+    Se envuelve en monoespaciado (```) para que las columnas cuadren en
+    Telegram.
+    """
+    return [
+        _aligned("Waves", _fmt_height(w)),
+        _aligned("Period", _fmt_period(w)),
+        _aligned("Swell", _fmt_swell(w)),
+        _aligned("Wind", _fmt_wind(w)),
+        _aligned("Sea", _fmt_sea(w)),
+        _aligned("Models", _fmt_models(w)),
+    ]
 
 
 def build_spot_message(result: SpotResult) -> str:
     """
-    Construye el mensaje de Telegram para UN spot con una UX minimalista:
-    sin iconos, sin separadores visuales y con foco en decision rapida.
+    Construye el mensaje de Telegram para UN spot (Propuesta A): cabecera con
+    veredicto y estrellas, detalle en columnas alineadas estilo Apple, en
+    ingles. Incluye direccion/periodo del swell y viento offshore/onshore.
     """
     spot = result.spot
     windows = _collect_and_merge_windows(result)
 
     if not windows:
-        # No deberia pasar (solo se llama si hay ventana), pero por seguridad.
-        return f"{spot.name}: condiciones surfeables detectadas.\n\n{spot.forecast_url}"
+        return f"*{spot.name}*\nSurfable conditions detected.\n{spot.forecast_url}"
 
     temp = result.water_temp
 
+    # --- UNA SOLA VENTANA ---
     if len(windows) == 1:
-        return _format_single_window_message(spot, windows[0], temp)
+        w = windows[0]
+        stars = _window_stars(w)
+        day = _day_label_en(w.start)
+        lines = [
+            f"*{spot.name}*",
+            f"{_verdict(stars)} · {_stars_str(stars)}",
+            "",
+            f"{day} · {w.start:%H:%M}–{w.end:%H:%M}  ({_window_hours(w)}h)",
+            "```",
+            *_window_detail_block(w),
+            "```",
+            _fmt_water(temp),
+            "",
+            f"[View full forecast]({spot.forecast_url})",
+        ]
+        return "\n".join(lines)
 
-    partes: list[str] = [
-        f"{spot.name} · {len(windows)} ventanas",
+    # --- VARIAS VENTANAS ---
+    # Veredicto global = el de la mejor ventana.
+    best_stars = max(_window_stars(w) for w in windows)
+    header = [
+        f"*{spot.name}*",
+        f"{_verdict(best_stars)} · {len(windows)} windows · best {_stars_str(best_stars)}",
         "",
     ]
 
-    for i, w in enumerate(windows):
-        if i > 0:
-            partes.append("")
-        partes.extend(_format_multi_window_block(w))
+    body: list[str] = []
+    current_day = None
+    for w in windows:
+        day = _day_label_en(w.start)
+        if day != current_day:
+            current_day = day
+            if body:
+                body.append("")
+            body.append(f"*{day}*")
+        stars = _window_stars(w)
+        body.append(f"{w.start:%H:%M}–{w.end:%H:%M} ({_window_hours(w)}h)  {_stars_str(stars)}")
+        body.append("```")
+        body.extend(_window_detail_block(w))
+        body.append("```")
 
-    partes.extend([
+    footer = [
+        _fmt_water(temp),
         "",
-        _format_water_line(temp),
-        "",
-        spot.forecast_url,
-    ])
+        f"[View full forecast]({spot.forecast_url})",
+    ]
+    return "\n".join(header + body + footer)
 
-    return "\n".join(partes)
+
+def _window_hours(w: _Window) -> int:
+    """Duracion de la ventana en horas (franjas horarias)."""
+    return int(round((w.end - w.start).total_seconds() / 3600)) + 1
 
 
 # ---------------------------------------------------------------------------
