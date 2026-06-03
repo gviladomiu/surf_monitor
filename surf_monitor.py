@@ -166,6 +166,19 @@ MODELS: dict[str, str] = {
     "ECMWF": "ecmwf_wam",
 }
 
+# Peso de fiabilidad de cada modelo para la media ponderada de altura de ola.
+# Doblamos los dos modelos con mejor criterio para esta costa:
+#   - EWAM: mayor resolucion (5 km), el mas fino para el Mediterraneo local.
+#   - ECMWF: el centro europeo, referencia mundial en fiabilidad.
+# Dejamos a 1 los secundarios (MFWAM solido pero sin destacar; GWAM es la
+# version basta de EWAM, 25 km). Editable si quieres recalibrar.
+MODEL_WEIGHTS: dict[str, float] = {
+    "EWAM": 2.0,
+    "ECMWF": 2.0,
+    "MFWAM": 1.0,
+    "GWAM": 1.0,
+}
+
 # Endpoints de Open-Meteo.
 MARINE_API_URL: str = "https://marine-api.open-meteo.com/v1/marine"
 FORECAST_API_URL: str = "https://api.open-meteo.com/v1/forecast"
@@ -776,6 +789,9 @@ class _Window:
     quality: str                  # "limpio" / "picado" / "mixto"
     models: set[str]              # modelos que la respaldan
     facing_deg: float             # orientacion de la playa (para offshore/onshore)
+    # Altura representativa (max de la racha) que aporta CADA modelo, para poder
+    # hacer la media ponderada por fiabilidad. {modelo: altura_max}.
+    height_by_model: dict[str, float] = field(default_factory=dict)
 
 
 def _streak_to_window(streak: list[SurfSlot], model: str, facing_deg: float) -> _Window:
@@ -807,6 +823,7 @@ def _streak_to_window(streak: list[SurfSlot], model: str, facing_deg: float) -> 
         quality=quality,
         models={model},
         facing_deg=facing_deg,
+        height_by_model={model: max(heights)},
     )
 
 
@@ -837,6 +854,7 @@ def _merge_windows(a: _Window, b: _Window) -> _Window:
         ),
         models=a.models | b.models,
         facing_deg=a.facing_deg,
+        height_by_model={**a.height_by_model, **b.height_by_model},
     )
 
 
@@ -869,11 +887,39 @@ def _collect_and_merge_windows(result: SpotResult) -> list[_Window]:
     return merged
 
 
+def _weighted_height(w: _Window) -> float | None:
+    """
+    Media ponderada por fiabilidad de la altura de ola entre los modelos que
+    respaldan la ventana. Cada modelo aporta su altura (max de su racha)
+    multiplicada por su peso de MODEL_WEIGHTS. Si no hay datos, None.
+    """
+    if not w.height_by_model:
+        return None
+    num = 0.0
+    den = 0.0
+    for model, h in w.height_by_model.items():
+        peso = MODEL_WEIGHTS.get(model, 1.0)
+        num += peso * h
+        den += peso
+    return num / den if den > 0 else None
+
+
 def _fmt_height(w: _Window) -> str:
-    """Rango de altura de ola."""
+    """
+    Rango envolvente de altura (min-max entre modelos) MAS el valor central
+    ponderado por fiabilidad como referencia. Ej: "0.9–1.1 m (~1.05)".
+    El rango avisa de la dispersion; el central es la mejor estimacion.
+    """
+    central = _weighted_height(w)
+    # Rango envolvente.
     if w.h_max - w.h_min < 0.1:
-        return f"{w.h_max:.1f} m"
-    return f"{w.h_min:.1f}–{w.h_max:.1f} m"
+        rango = f"{w.h_max:.1f} m"
+        # Si el rango es estrecho, el central no aporta; lo omitimos.
+        return rango
+    rango = f"{w.h_min:.1f}–{w.h_max:.1f} m"
+    if central is not None:
+        return f"{rango} (~{central:.1f})"
+    return rango
 
 
 def _fmt_period(w: _Window) -> str:
@@ -932,9 +978,16 @@ def _fmt_models(w: _Window) -> str:
 
 
 def _window_stars(w: _Window) -> int:
-    """Estrellas de calidad de una ventana, usando su mejor altura."""
+    """
+    Estrellas de calidad de una ventana. Usa la altura PONDERADA por
+    fiabilidad (no el maximo optimista), para que un solo modelo alegre no
+    infle la nota.
+    """
     wind_class = classify_wind(w.facing_deg, w.wind_dir)
-    return compute_stars(w.h_max, w.swell_period, w.wind_kmh, wind_class, len(w.models))
+    height = _weighted_height(w)
+    if height is None:
+        height = w.h_max  # fallback defensivo
+    return compute_stars(height, w.swell_period, w.wind_kmh, wind_class, len(w.models))
 
 
 def _verdict(stars: int) -> str:
