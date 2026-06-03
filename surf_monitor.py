@@ -15,9 +15,10 @@ FUENTE DE DATOS
       - Marine API   : oleaje (altura, periodo, swell, wind wave) + temperatura
                        del agua (sea_surface_temperature, sin forzar modelo).
       - Forecast API : viento (velocidad y direccion) + orto/ocaso.
-    Los modelos de oleaje son los del servicio aleman DWD: EWAM (Europa, alta
-    resolucion 5 km) y GWAM (global). Son los mismos que Windguru etiqueta como
-    "ICON Wave" / "EWAM". No requiere clave de API.
+    Los modelos de oleaje son cuatro, de tres casas independientes: EWAM y
+    GWAM (DWD aleman), MFWAM (MeteoFrance, via Copernicus) y ECMWF WAM (centro
+    europeo). Cuando varios coinciden, mas fiable la prevision. No requiere
+    clave de API.
 
 POR QUE LA ALTURA DE OLA NO BASTA PARA SURF
     Una ola de 1 m puede ser surfeable (si viene del SWELL, oleaje de fondo
@@ -37,8 +38,8 @@ LOGICA: una franja horaria se considera SURFEABLE si cumple las 5 condiciones:
 
     Si hay >= CONSECUTIVE_SLOTS franjas surfeables seguidas (defecto 3), el
     spot tiene una "ventana". Se manda UN mensaje por spot con ventana,
-    combinando los dos modelos (EWAM y GWAM) y recomendando neopreno segun la
-    temperatura del agua.
+    combinando los cuatro modelos y recomendando neopreno segun la temperatura
+    del agua.
 
 Variables de entorno:
     TELEGRAM_BOT_TOKEN     Token del bot de Telegram (obligatorio para alertas).
@@ -149,14 +150,20 @@ TELEGRAM_API_URL: str = "https://api.telegram.org/bot{token}/sendMessage"
 # ---------------------------------------------------------------------------
 # MODELOS DE OLEAJE
 # ---------------------------------------------------------------------------
-# Open-Meteo NO tiene un modelo marino llamado "icon". El ICON Wave del DWD se
-# publica dividido en:
-#   "ewam" -> DWD EWAM: Europa, alta resolucion 5 km. El mejor para esta costa.
-#   "gwam" -> DWD GWAM: global, 25 km. Segundo modelo / respaldo.
-# Otros validos: "ecmwf_wam", "meteofrance_wave".
+# Cuatro modelos de oleaje de tres casas independientes, para un consenso mas
+# fiable. Cuando varios coinciden, mas confianza en la prevision.
+#   "ewam"            -> DWD EWAM: Europa, 5 km. La mejor resolucion local.
+#   "gwam"            -> DWD GWAM: global, 25 km. Hermano global del EWAM.
+#   "meteofrance_wave"-> MeteoFrance MFWAM: global, ~8 km (via Copernicus).
+#   "ecmwf_wam"       -> ECMWF WAM: global, 9 km. Casa independiente (el centro
+#                        europeo, referencia mundial en prevision).
+# Nota: EWAM y GWAM comparten origen (DWD/ICON Wave); MFWAM y ECMWF aportan
+# opiniones verdaderamente independientes, que es lo que mejora el consenso.
 MODELS: dict[str, str] = {
     "EWAM": "ewam",
     "GWAM": "gwam",
+    "MFWAM": "meteofrance_wave",
+    "ECMWF": "ecmwf_wam",
 }
 
 # Endpoints de Open-Meteo.
@@ -675,7 +682,7 @@ def compute_stars(
     swell_period: float | None,
     wind_kmh: float | None,
     wind_class: str,
-    models_agree: bool,
+    n_models_agree: int,
 ) -> int:
     """
     Calcula la calidad de una ventana en estrellas (1-5), calibrado para el
@@ -686,7 +693,10 @@ def compute_stars(
       - Tamano (0-2): lo primero, sin tamano no hay sesion.
       - Periodo del swell (0-1.5): la energia/calidad de la ola.
       - Viento (0-1.5): OPCION DURA, onshore penaliza a 0.
-      - Coincidencia de modelos (0-0.5): fiabilidad de la prevision.
+      - Consenso de modelos (0-0.5): cuantos de los 4 modelos coinciden en la
+        ventana. Mas modelos de acuerdo = prevision mas fiable.
+
+    'n_models_agree' es cuantos modelos respaldan la ventana (1 a 4).
 
     5 estrellas es RARO Y ESPECIAL: exige >=5.0 puntos Y tamano real (>=1.0m).
     Un dia pequeno, por perfecto que este, tope en 4 estrellas.
@@ -719,9 +729,10 @@ def compute_stars(
         p += 0.5
     pts += min(p, 1.5)
 
-    # Coincidencia de modelos (0-0.5).
-    if models_agree:
-        pts += 0.5
+    # Consenso de modelos (0-0.5), graduado por cuantos coinciden de los 4:
+    #   4 modelos -> +0.5 · 3 -> +0.4 · 2 -> +0.25 · 1 -> +0.0
+    consenso_pts = {4: 0.5, 3: 0.4, 2: 0.25}.get(n_models_agree, 0.0)
+    pts += consenso_pts
 
     # Mapeo. 5 estrellas raro: umbral alto Y tamano real.
     if pts >= 5.0 and height_max >= 1.0:
@@ -905,17 +916,25 @@ def _fmt_sea(w: _Window) -> str:
 
 
 def _fmt_models(w: _Window) -> str:
-    """Modelos que respaldan la ventana."""
-    if len(w.models) >= 2:
-        return "EWAM + GWAM"
-    return f"{next(iter(w.models))} only"
+    """
+    Modelos que respaldan la ventana, en el orden de MODELS. Si coinciden los
+    cuatro, lo resumimos como "all 4 models" para no alargar la linea.
+    """
+    total = len(MODELS)
+    n = len(w.models)
+    if n >= total:
+        return f"all {total} models"
+    # Listar en el orden canonico de MODELS los que esten presentes.
+    presentes = [m for m in MODELS if m in w.models]
+    if n == 1:
+        return f"{presentes[0]} only"
+    return " + ".join(presentes)
 
 
 def _window_stars(w: _Window) -> int:
     """Estrellas de calidad de una ventana, usando su mejor altura."""
     wind_class = classify_wind(w.facing_deg, w.wind_dir)
-    models_agree = len(w.models) >= 2
-    return compute_stars(w.h_max, w.swell_period, w.wind_kmh, wind_class, models_agree)
+    return compute_stars(w.h_max, w.swell_period, w.wind_kmh, wind_class, len(w.models))
 
 
 def _verdict(stars: int) -> str:
