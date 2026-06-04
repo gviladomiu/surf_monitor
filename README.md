@@ -184,6 +184,46 @@ una con sus estrellas, y el veredicto global toma la mejor.
 
 ---
 
+## 🔁 Sin avisos repetidos
+
+El monitor corre cada 6 horas, así que una misma ventana podría detectarse en
+varias ejecuciones seguidas. Para no recibir el mismo aviso cuatro veces, el
+monitor **recuerda lo que ya ha notificado**.
+
+Guarda por spot una "firma" de sus ventanas (día, horario y estrellas de cada
+una) en un fichero `.surf_state.json`, que GitHub Actions conserva entre
+ejecuciones mediante su caché. La lógica:
+
+- Si un spot tiene una ventana **ya avisada y sin cambios**, no repite el aviso.
+- Si aparece una ventana nueva, cambia el horario o cambia la calidad (sube o
+  baja de estrellas), la firma cambia y **sí vuelve a avisar**, con la info
+  actualizada.
+- Si un spot deja de tener ventanas, se olvida su firma, de modo que un futuro
+  repunte vuelva a avisar.
+
+Notas:
+- La **primera ejecución** tras desplegar no tiene estado previo (lo verás en
+  el log: "No hay estado previo"), así que avisará de todo lo que encuentre. A
+  partir de la segunda ya filtra duplicados.
+- Si el monitor pasara **más de 7 días sin ejecutarse**, GitHub borraría la
+  caché y podría repetir un aviso. Con ejecuciones cada 6 h no ocurre en la
+  práctica.
+- Para forzar el envío siempre (al probar), pon `ALWAYS_NOTIFY: "1"` en el
+  workflow.
+
+---
+
+## 🕐 Horas en local
+
+Open-Meteo devuelve las horas en la zona configurada (`Europe/Madrid`) pero sin
+marca de zona horaria, mientras que el runner de GitHub Actions trabaja en UTC.
+El monitor calcula "ahora" explícitamente en hora de Madrid para que la ventana
+de "+3 h" y las etiquetas Today/Tomorrow sean correctas, sin desfases por el
+cambio de hora ni por la zona del servidor. Si cambias `TIMEZONE`, todo el
+cálculo se ajusta a esa zona.
+
+---
+
 ## 🧴 Recomendación de neopreno
 
 Según la temperatura del agua, para una sesión de 2-3 h (exposición larga, por
@@ -215,6 +255,10 @@ lo que se abriga un punto más que para un baño corto):
 ├── .gitignore
 └── README.md                  # Este archivo
 ```
+
+> El fichero `.surf_state.json` (anti-duplicados) lo crea el propio monitor en
+> tiempo de ejecución y lo gestiona la caché de GitHub Actions. No hay que
+> crearlo ni subirlo: está ignorado en `.gitignore`.
 
 ---
 
