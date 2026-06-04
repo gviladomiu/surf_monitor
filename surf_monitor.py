@@ -60,6 +60,7 @@ de entorno, porque son varios y cada uno tiene nombre, coordenadas y URL).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -146,6 +147,15 @@ TIMEZONE: str = os.getenv("TIMEZONE", "Europe/Madrid")
 TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID: str | None = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API_URL: str = "https://api.telegram.org/bot{token}/sendMessage"
+
+# Fichero de estado para no repetir alertas identicas. Guarda, por spot, una
+# "firma" de las ventanas ya avisadas. Solo se notifica si la firma cambia
+# (ventana nueva, horario distinto o calidad distinta). En GitHub Actions se
+# persiste entre ejecuciones via cache (ver el workflow). Si no existe (primera
+# ejecucion), se asume que no se ha avisado nada todavia.
+STATE_FILE: str = os.getenv("STATE_FILE", ".surf_state.json")
+# Si se pone a "1", se ignora el estado y se notifica siempre (util para probar).
+ALWAYS_NOTIFY: bool = os.getenv("ALWAYS_NOTIFY", "0") == "1"
 
 # ---------------------------------------------------------------------------
 # MODELOS DE OLEAJE
@@ -565,13 +575,28 @@ def fetch_model_forecast(spot: Spot, model_label: str, model_id: str, aux: Auxil
 # LOGICA DE NEGOCIO: VENTANA TEMPORAL, FILTRADO Y DETECCION
 # ---------------------------------------------------------------------------
 
+def now_local() -> datetime:
+    """
+    Hora actual en la zona horaria configurada (TIMEZONE), devuelta como
+    datetime NAIVE (sin tzinfo).
+
+    Por que naive: Open-Meteo, con timezone=Europe/Madrid, devuelve los
+    timestamps en hora LOCAL de Madrid pero SIN marca de zona horaria. Para
+    compararlos correctamente necesitamos un "ahora" tambien en hora de Madrid
+    y tambien naive. Si usaramos datetime.now() a secas, en el runner de GitHub
+    (que va en UTC) tendriamos un desfase de 1-2 horas y la ventana de busqueda
+    quedaria corrida. Esta funcion resuelve ese bug.
+    """
+    return datetime.now(ZoneInfo(TIMEZONE)).replace(tzinfo=None)
+
+
 def get_search_start(reference: datetime | None = None) -> datetime:
     """
-    Devuelve el momento a partir del cual buscamos ventanas: AHORA mas el
-    tiempo de antelacion (LEAD_TIME_HOURS), redondeado hacia arriba a la hora
-    en punto (los datos de Open-Meteo son horarios).
+    Devuelve el momento a partir del cual buscamos ventanas: AHORA (hora local
+    del spot) mas el tiempo de antelacion (LEAD_TIME_HOURS), redondeado hacia
+    arriba a la hora en punto (los datos de Open-Meteo son horarios).
     """
-    ref = reference or datetime.now()
+    ref = reference or now_local()
     start = ref + timedelta(hours=LEAD_TIME_HOURS)
     # Redondear hacia arriba a la siguiente hora en punto.
     if start.minute > 0 or start.second > 0 or start.microsecond > 0:
@@ -579,6 +604,7 @@ def get_search_start(reference: datetime | None = None) -> datetime:
     else:
         start = start.replace(minute=0, second=0, microsecond=0)
     return start
+
 
 
 def filter_slots_from_now(slots: list[SurfSlot], reference: datetime | None = None) -> list[SurfSlot]:
@@ -835,6 +861,11 @@ def _overlaps(a: _Window, b: _Window) -> bool:
 def _merge_windows(a: _Window, b: _Window) -> _Window:
     """Fusiona dos ventanas solapadas, uniendo rangos y modelos."""
     a_larga = (a.end - a.start) >= (b.end - b.start)
+    # Altura por modelo: si un modelo aparece en ambas, nos quedamos con su
+    # maximo (no sobrescribimos), para no perder informacion en la ponderada.
+    hbm = dict(a.height_by_model)
+    for model, h in b.height_by_model.items():
+        hbm[model] = max(hbm.get(model, h), h)
     return _Window(
         start=min(a.start, b.start),
         end=max(a.end, b.end),
@@ -854,7 +885,7 @@ def _merge_windows(a: _Window, b: _Window) -> _Window:
         ),
         models=a.models | b.models,
         facing_deg=a.facing_deg,
-        height_by_model={**a.height_by_model, **b.height_by_model},
+        height_by_model=hbm,
     )
 
 
@@ -863,6 +894,11 @@ def _collect_and_merge_windows(result: SpotResult) -> list[_Window]:
     Toma todas las rachas de todos los modelos del spot, las convierte en
     _Window, y fusiona las que se solapan en el tiempo (aunque vengan de
     modelos distintos). Devuelve la lista final ordenada cronologicamente.
+
+    Usa el algoritmo estandar de fusion de intervalos: ordenar por inicio y
+    fusionar cada ventana con el acumulador si se solapa. Esto fusiona
+    correctamente cadenas A-B-C (A solapa B, B solapa C, aunque A no toque C),
+    cosa que la version anterior (parar en la primera coincidencia) no hacia.
     """
     facing = result.spot.facing_deg
     raw: list[_Window] = []
@@ -870,20 +906,17 @@ def _collect_and_merge_windows(result: SpotResult) -> list[_Window]:
         for streak in streaks:
             raw.append(_streak_to_window(streak, model_label, facing))
 
-    # Fusion iterativa: mientras encontremos solapamientos, fusionamos.
+    if not raw:
+        return []
+
     raw.sort(key=lambda w: w.start)
-    merged: list[_Window] = []
-    for w in raw:
-        fusion_hecha = False
-        for i, m in enumerate(merged):
-            if _overlaps(w, m):
-                merged[i] = _merge_windows(m, w)
-                fusion_hecha = True
-                break
-        if not fusion_hecha:
+    merged: list[_Window] = [raw[0]]
+    for w in raw[1:]:
+        if _overlaps(merged[-1], w):
+            merged[-1] = _merge_windows(merged[-1], w)
+        else:
             merged.append(w)
 
-    merged.sort(key=lambda w: w.start)
     return merged
 
 
@@ -1003,10 +1036,7 @@ def _verdict(stars: int) -> str:
 
 def _day_label_en(dt: datetime) -> str:
     """Etiqueta de dia en ingles (Today / Tomorrow / Wed 04/06)."""
-    try:
-        today = datetime.now(ZoneInfo(TIMEZONE)).date()
-    except Exception:
-        today = datetime.now().date()
+    today = now_local().date()
     if dt.date() == today:
         return "Today"
     if dt.date() == today + timedelta(days=1):
@@ -1148,6 +1178,57 @@ def send_telegram_message(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# ESTADO ANTI-DUPLICADOS
+# ---------------------------------------------------------------------------
+# Para no repetir el mismo aviso cada 6 horas, guardamos por spot una "firma"
+# de las ventanas ya notificadas. Solo se vuelve a avisar de un spot si su
+# firma cambia (aparece una ventana nueva, cambia el horario o cambia la
+# calidad en estrellas). El estado se persiste en un fichero JSON que GitHub
+# Actions cachea entre ejecuciones.
+
+def _spot_signature(result: SpotResult) -> str:
+    """
+    Firma del conjunto de ventanas de un spot. Se basa en, por cada ventana,
+    su dia, hora de inicio y fin, y sus estrellas. Asi, si el horario o la
+    calidad cambian, la firma cambia y se vuelve a avisar; si todo sigue igual,
+    la firma se mantiene y no se repite el mensaje.
+    """
+    windows = _collect_and_merge_windows(result)
+    partes = []
+    for w in sorted(windows, key=lambda x: x.start):
+        stars = _window_stars(w)
+        partes.append(f"{w.start:%Y-%m-%dT%H}|{w.end:%H}|{stars}")
+    return ";".join(partes)
+
+
+def load_alert_state(path: str) -> dict[str, str]:
+    """
+    Carga el estado de alertas (firma por spot) desde el fichero JSON.
+    Si no existe o esta corrupto, devuelve un estado vacio (primera ejecucion).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except FileNotFoundError:
+        log.info("[estado] No hay estado previo (primera ejecucion).")
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("[estado] No se pudo leer el estado (%s); se asume vacio.", e)
+    return {}
+
+
+def save_alert_state(path: str, state: dict[str, str]) -> None:
+    """Guarda el estado de alertas (firma por spot) en el fichero JSON."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        log.info("[estado] Estado guardado (%d spots).", len(state))
+    except OSError as e:
+        log.warning("[estado] No se pudo guardar el estado: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # ORQUESTADOR
 # ---------------------------------------------------------------------------
 
@@ -1205,8 +1286,13 @@ def run() -> int:
         DAYLIGHT_MARGIN_MIN, LEAD_TIME_HOURS, CONSECUTIVE_SLOTS,
     )
 
+    # Estado anti-duplicados: firma de las ventanas ya avisadas por spot.
+    state = {} if ALWAYS_NOTIFY else load_alert_state(STATE_FILE)
+    new_state: dict[str, str] = dict(state)
+
     messages_sent = 0
     spots_with_window = 0
+    spots_skipped_dup = 0
 
     for spot in SPOTS:
         log.info("--- Evaluando spot: %s ---", spot.name)
@@ -1216,17 +1302,35 @@ def run() -> int:
             log.error("[%s] Error evaluando el spot: %s", spot.name, e)
             continue
 
-        if result.has_window():
-            spots_with_window += 1
-            message = build_spot_message(result)
-            if send_telegram_message(message):
-                messages_sent += 1
-        else:
+        if not result.has_window():
             log.info("[%s] Sin ventana surfeable; no se notifica.", spot.name)
+            # Si el spot dejo de tener ventanas, limpiamos su firma para que un
+            # futuro repunte vuelva a avisar.
+            new_state.pop(spot.name, None)
+            continue
+
+        spots_with_window += 1
+        signature = _spot_signature(result)
+
+        # Si la firma coincide con la ya avisada, no repetimos.
+        if not ALWAYS_NOTIFY and state.get(spot.name) == signature:
+            log.info("[%s] Ventana ya avisada (sin cambios); no se repite.", spot.name)
+            spots_skipped_dup += 1
+            continue
+
+        message = build_spot_message(result)
+        if send_telegram_message(message):
+            messages_sent += 1
+            new_state[spot.name] = signature  # registrar solo si se envio bien
+
+    # Persistir el estado actualizado (salvo en modo ALWAYS_NOTIFY).
+    if not ALWAYS_NOTIFY:
+        save_alert_state(STATE_FILE, new_state)
 
     log.info(
-        "=== Fin. %d spot(s) con ventana, %d mensaje(s) enviado(s). ===",
-        spots_with_window, messages_sent,
+        "=== Fin. %d spot(s) con ventana, %d mensaje(s) enviado(s), "
+        "%d sin cambios (omitidos). ===",
+        spots_with_window, messages_sent, spots_skipped_dup,
     )
     return 0
 
