@@ -716,6 +716,37 @@ def classify_wind(beach_facing_deg: float, wind_from_deg: float | None) -> str:
     return "onshore"
 
 
+def _wind_score(wind_class: str, wind_kmh: float | None) -> float:
+    """
+    Puntuacion del viento para las estrellas, segun clase y fuerza. A
+    diferencia de la version anterior (solo sumaba), ahora el viento puede
+    RESTAR: un viento del mar fuerte hunde activamente la nota.
+
+    Tabla (km/h):
+        Offshore  <=12: +1.0   · >12: 0.0
+        Cross-off <=12: +0.7   · >12: -0.3
+        Cross-on  <=12: +0.3   · >12: -0.6   · >20: -1.5
+        Onshore   <=12:  0.0   · >12: -1.0   · >20: -1.5
+
+    Sin dato de viento: 0.0 (neutro, no penaliza).
+    Para offshore/cross-off >20 no hay penalizacion extra mas alla de su valor
+    de >12 (un viento de tierra fuerte molesta, pero no deshace la ola como el
+    de mar; a lo sumo la sostiene de mas).
+    """
+    if wind_kmh is None:
+        return 0.0
+    # Viento de mar muy fuerte: lo peor.
+    if wind_kmh > 20 and wind_class in ("cross-on", "onshore"):
+        return -1.5
+    # Viento flojo (<=12 km/h): el unico tramo que puede sumar.
+    if wind_kmh <= 12:
+        return {"offshore": 1.0, "cross-off": 0.7,
+                "cross-on": 0.3, "onshore": 0.0}.get(wind_class, 0.3)
+    # Viento medio (>12 km/h, hasta 20): empieza a penalizar.
+    return {"offshore": 0.0, "cross-off": -0.3,
+            "cross-on": -0.6, "onshore": -1.0}.get(wind_class, -0.3)
+
+
 def compute_stars(
     height_max: float,
     swell_period: float | None,
@@ -728,21 +759,22 @@ def compute_stars(
     Mediterraneo (swell debil): 5 estrellas no es un dia de oceano, es un dia
     notable PARA ESTA COSTA.
 
-    Suma puntos de 4 factores (maximo teorico 5.5):
-      - Tamano (0-2): lo primero, sin tamano no hay sesion.
-      - Periodo del swell (0-1.5): la energia/calidad de la ola.
-      - Viento (0-1.5): OPCION DURA, onshore penaliza a 0.
-      - Consenso de modelos (0-0.5): cuantos de los 4 modelos coinciden en la
-        ventana. Mas modelos de acuerdo = prevision mas fiable.
+    Suma puntos de 4 factores (rango total -1.0 a 5.0):
+      - Tamano (0.5 a 2.0): lo primero, sin tamano no hay sesion.
+      - Periodo del swell (0 a 1.5): la energia/calidad de la ola.
+      - Viento (-1.5 a +1.0): ahora puede RESTAR. El viento del mar fuerte
+        hunde la nota (ver _wind_score).
+      - Consenso de modelos (0 a 0.5): cuantos de los 4 modelos coinciden.
 
     'n_models_agree' es cuantos modelos respaldan la ventana (1 a 4).
 
-    5 estrellas es RARO Y ESPECIAL: exige >=5.0 puntos Y tamano real (>=1.0m).
-    Un dia pequeno, por perfecto que este, tope en 4 estrellas.
+    5 estrellas es MUY RARO Y ESPECIAL: exige >=4.8 puntos Y tamano real
+    (>=1.0m). En la practica solo lo logra un dia con tamano >=1.2m, periodo
+    >=6s, offshore flojo y consenso de modelos: lo mejor que da esta costa.
     """
     pts = 0.0
 
-    # Tamano (0-2).
+    # Tamano (0.5 a 2.0).
     if height_max >= 1.2:
         pts += 2.0
     elif height_max >= 1.0:
@@ -752,7 +784,7 @@ def compute_stars(
     else:
         pts += 0.5
 
-    # Periodo del swell (0-1.5).
+    # Periodo del swell (0 a 1.5).
     sp = swell_period if swell_period is not None else 0.0
     if sp >= 6:
         pts += 1.5
@@ -761,26 +793,21 @@ def compute_stars(
     elif sp >= 4:
         pts += 0.5
 
-    # Viento (0-1.5). Opcion dura: onshore = 0.
-    clase_pts = {"offshore": 1.0, "cross-off": 0.6, "cross-on": 0.3, "onshore": 0.0}
-    p = clase_pts.get(wind_class, 0.3)
-    if wind_kmh is not None and wind_kmh < 12:
-        p += 0.5
-    pts += min(p, 1.5)
+    # Viento (-1.5 a +1.0): puede sumar o restar.
+    pts += _wind_score(wind_class, wind_kmh)
 
-    # Consenso de modelos (0-0.5), graduado por cuantos coinciden de los 4:
-    #   4 modelos -> +0.5 · 3 -> +0.4 · 2 -> +0.25 · 1 -> +0.0
-    consenso_pts = {4: 0.5, 3: 0.4, 2: 0.25}.get(n_models_agree, 0.0)
-    pts += consenso_pts
+    # Consenso de modelos (0 a 0.5): 4 -> +0.5 · 3 -> +0.4 · 2 -> +0.25 · 1 -> 0.
+    pts += {4: 0.5, 3: 0.4, 2: 0.25}.get(n_models_agree, 0.0)
 
-    # Mapeo. 5 estrellas raro: umbral alto Y tamano real.
-    if pts >= 5.0 and height_max >= 1.0:
+    # Mapeo (recalibrado para el nuevo rango, max 5.0).
+    # 5 estrellas muy raro: umbral 4.8 Y tamano real.
+    if pts >= 4.8 and height_max >= 1.0:
         return 5
-    if pts >= 3.5:
+    if pts >= 3.3:
         return 4
-    if pts >= 2.5:
+    if pts >= 2.2:
         return 3
-    if pts >= 1.5:
+    if pts >= 1.2:
         return 2
     return 1
 
