@@ -70,6 +70,8 @@ jobs:
       CONSECUTIVE_SLOTS: "3"       # franjas seguidas para disparar la alerta
       TIMEZONE: "Europe/Madrid"
       LOG_LEVEL: "INFO"
+      # Fichero donde se guarda que ventanas ya se han avisado (anti-duplicados).
+      STATE_FILE: ".surf_state.json"
 
     steps:
       # 1) Descargar el codigo del repositorio.
@@ -83,12 +85,26 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      # 3) Instalar dependencias (solo 'requests').
+      # 3) Recuperar el estado de alertas de ejecuciones anteriores.
+      #    La cache de GitHub Actions es inmutable por clave, asi que usamos una
+      #    clave UNICA por ejecucion (siempre guarda al final) y 'restore-keys'
+      #    para recuperar la cache mas reciente que empiece por "surf-state-".
+      #    Asi el fichero .surf_state.json persiste de una ejecucion a la
+      #    siguiente y el monitor no repite avisos identicos.
+      - name: Recuperar estado de alertas
+        uses: actions/cache@v4
+        with:
+          path: .surf_state.json
+          key: surf-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            surf-state-
+
+      # 4) Instalar dependencias (solo 'requests').
       - name: Instalar dependencias Python
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4) Ejecutar el monitor.
+      # 5) Ejecutar el monitor.
       - name: Ejecutar Surf Monitor
         run: python surf_monitor.py
