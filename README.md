@@ -801,3 +801,5 @@ Código bajo licencia MIT. Datos de oleaje, viento, temperatura del agua y
 orto/ocaso por **Open-Meteo** (CC BY 4.0), generados a partir de los modelos
 del DWD (EWAM, GWAM), ECMWF (WAM) y MeteoFrance (MFWAM y SST, vía Copernicus
 Marine).
+
+
